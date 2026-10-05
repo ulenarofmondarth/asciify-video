@@ -194,30 +194,61 @@ def extract_frames(video_path, frames_dir, target_fps=None, ascii_width=240):
     return frames
 
 def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
-    """Convert each PNG frame to ASCII text using jp2a."""
+    """Convert frames to ASCII via direct luminance mapping (no jp2a)."""
+    from PIL import Image
     txt_dir.mkdir(parents=True, exist_ok=True)
 
+    # Light (space) -> dense (@); mirrors the ramp jp2a uses
+    ramp = " .',;:clodxkO0KXNWM"
+    #ramp = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
     ascii_files = []
 
-    jp2a_args = [f'--width={width}']
-    if colorized:
-        jp2a_args.append('--colors')
+    for frame in tqdm(frames, desc="  Converting to ASCII", unit="frame"):
+        txt_file = txt_dir / f'{frame.stem}.txt'
+        img = Image.open(frame).convert('L')
+        w, h = img.size
+        # Character cells are ~2:1 (taller than wide): halve the rows
+        rows = max(1, h // 2)
+        # Frames are already `width` px wide after the extraction fix;
+        # the resize below is an identity in that case
+        img = img.resize((width, rows), Image.LANCZOS)
 
-    for i, frame in enumerate(tqdm(frames, desc="  Converting to ASCII", unit="frame")):
-        txt_file = txt_dir / f'{str(frame.stem)}.txt'
-
-        cmd = ['jp2a'] + jp2a_args + [str(frame)]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"\nWarning: jp2a failed for {frame.name}")
-            continue
-
+        scale = len(ramp) / 256
         with open(txt_file, 'w') as f:
-            f.write(result.stdout)
+            for y in range(rows):
+                line = ''.join(
+                    ramp[min(len(ramp) - 1, int(img.getpixel((x, y)) * scale))]
+                    for x in range(width))
+                f.write(line + '\n')
         ascii_files.append(txt_file)
 
     return ascii_files
+
+#def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
+#    """Convert each PNG frame to ASCII text using jp2a."""
+#    txt_dir.mkdir(parents=True, exist_ok=True)
+#
+#    ascii_files = []
+#
+#    jp2a_args = [f'--width={width}']
+#    if colorized:
+#        jp2a_args.append('--colors')
+#
+#    for i, frame in enumerate(tqdm(frames, desc="  Converting to ASCII", unit="frame")):
+#        txt_file = txt_dir / f'{str(frame.stem)}.txt'
+#
+#        cmd = ['jp2a'] + jp2a_args + [str(frame)]
+#
+#        result = subprocess.run(cmd, capture_output=True, text=True)
+#        if result.returncode != 0:
+#            print(f"\nWarning: jp2a failed for {frame.name}")
+#            continue
+#
+#        with open(txt_file, 'w') as f:
+#            f.write(result.stdout)
+#        ascii_files.append(txt_file)
+#
+#    return ascii_files
 
 
 def load_monospace_font(font_size=12):
