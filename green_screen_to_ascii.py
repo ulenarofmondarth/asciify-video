@@ -9,6 +9,7 @@ Features:
 - Automatic green color detection
 - Progress bars for all stages
 - Configurable chromakey parameters
+- Option to leave black areas truly black (no characters)
 """
 
 import argparse
@@ -64,7 +65,7 @@ def sample_green_color(input_path, sample_frames=10):
                     '-ss', str(sample_time),
                     '-i', str(input_path),
                     '-frames:v', '1',
-                    '-vf', f"crop='iw/3:{int}(ih/3)':{int}(iw/3):(ih/3)",  # Center 1/3 crop
+                    '-vf', 'crop=iw/3:ih/3:iw/3:ih/3',  # Center 1/3 crop
                     '-f', 'rawvideo',
                     '-pix_fmt', 'rgb24',
                     '-'
@@ -163,53 +164,51 @@ def chromakey_to_black(input_path, output_path, key_color, tolerance, edge_blend
     run_command(cmd, check=True)
     return output_path
 
-def extract_frames(video_path, frames_dir, target_fps=None, scale_divisor=8):
-    """Extract frames from the chromakeyed video with progress bar."""
+def extract_frames_with_masks(video_path, frames_dir, mask_dir, target_fps=None, scale_divisor=8, black_threshold=30):
+    """Extract frames and blackness masks from the chromakeyed video with progress bar."""
     frames_dir.mkdir(parents=True, exist_ok=True)
+    mask_dir.mkdir(parents=True, exist_ok=True)
 
     # Scale down for ASCII rendering (each char = block of pixels)
     scale_filter = f'scale=iw/{scale_divisor}:-1,fps={target_fps}'
 
-    # First, count total frames
-    probe_cmd = [
-        'ffprobe', '-v', 'quiet', '-count_frames',
-        '-select_streams', 'v:0', '-show_entries', 'stream_side_data=nb_read_frames',
-        '-of', 'default=nokey=1:noprint_wrappers=1', str(video_path)
-    ]
-    try:
-        total_frames = int(run_command(probe_cmd).stdout.strip())
-    except:
-        total_frames = None
-
-    cmd = [
+    # Extract frames
+    frame_cmd = [
         'ffmpeg', '-y', '-i', str(video_path),
         '-vf', scale_filter,
         str(frames_dir / 'frame_%06d.png')
     ]
+    run_command(frame_cmd)
 
-    # Run ffmpeg with stderr capture for progress
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Also extract luminance masks at the same scale
+    # Mask is white where pixel is NOT black, black where pixel IS black
+    mask_filter = f'{scale_filter},hue=s=0,crop=trunc(iw/ah/2)*2:trunc(ih/ah/2)*2,eq=brightness=0.5,threshold={black_threshold}/0/0,curves=preset=linear'
 
-    # Try to parse frame count from stderr if ffmpeg reports it
-    if total_frames is None:
-        # Estimate based on fps and duration
-        try:
-            dur_cmd = [
-                'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)
-            ]
-            duration = float(run_command(dur_cmd).stdout.strip())
-            total_frames = int(duration * target_fps)
-        except:
-            pass
+    mask_cmd = [
+        'ffmpeg', '-y', '-i', str(video_path),
+        '-vf', mask_filter,
+        str(mask_dir / 'mask_%06d.png')
+    ]
+    run_command(mask_cmd)
 
-    print(f"  Extracted frames to {frames_dir}")
-    if total_frames:
-        print(f"  Total: ~{total_frames} frames")
+    frames = list(frames_dir.glob('frame_*.png'))
+    masks = list(mask_dir.glob('mask_*.png'))
 
-    return list(frames_dir.glob('frame_*.png'))
+    # Sort and match
+    frames.sort(key=lambda x: int(x.stem.replace('frame_', '')))
+    masks.sort(key=lambda x: int(x.stem.replace('mask_', '')))
 
-def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
+    # Ensure matching count
+    min_count = min(len(frames), len(masks))
+    frames = frames[:min_count]
+    masks = masks[:min_count]
+
+    print(f"  Extracted {len(frames)} frames to {frames_dir}")
+    print(f"  Created {len(masks)} masks to {mask_dir}")
+
+    return frames, masks
+
+def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False, keep_black=False):
     """Convert each PNG frame to ASCII text using jp2a with progress bar."""
     txt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -235,7 +234,8 @@ def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
 
     return ascii_files
 
-def render_ascii_to_images(ascii_files, img_dir, font_size=12):
+def render_ascii_to_images(ascii_files, img_dir, mask_files=None, font_size=12,
+                           use_masks=True, black_threshold=50):
     """Render ASCII text files as images with progress bar."""
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -291,9 +291,40 @@ def render_ascii_to_images(ascii_files, img_dir, font_size=12):
         img = Image.new('RGB', (img_width, img_height), color='black')
         draw = ImageDraw.Draw(img)
 
-        # Draw ASCII text in bright green for contrast
+        # Load mask if provided and enabled
+        mask_img = None
+        if use_masks and mask_files and i < len(mask_files):
+            try:
+                mask_img = Image.open(mask_files[i])
+                mask_gray = mask_img.convert('L')  # Convert to grayscale
+            except Exception as e:
+                print(f"  Warning: Could not load mask for frame {i}: {e}")
+                mask_img = None
+
+        # Draw ASCII text with optional mask consideration
         for y, line in enumerate(lines):
-            draw.text((0, y * char_height), line, fill=(100, 255, 100), font=font)
+            for x, char in enumerate(line):
+                if char == ' ':
+                    continue  # Skip spaces anyway
+
+                if mask_img:
+                    # Check corresponding position in mask
+                    # Map character position to mask pixel position
+                    mask_x = int(x * char_width / char_width * mask_img.width / img_width)
+                    mask_y = int(y * char_height / char_height * mask_img.height / img_height)
+                    mask_x = min(mask_x, mask_img.width - 1)
+                    mask_y = min(mask_y, mask_img.height - 1)
+
+                    mask_pixel = mask_gray.getpixel((mask_x, mask_y))
+
+                    # If mask indicates this area is "black" (below threshold), skip drawing
+                    if mask_pixel < black_threshold:
+                        continue
+
+                # Draw the character
+                char_x = x * char_width
+                char_y = y * char_height
+                draw.text((char_x, char_y), char, fill=(100, 255, 100), font=font)
 
         out_path = img_dir / f'rendered_{str(ascii_file.stem).zfill(6)}.png'
         img.save(out_path)
@@ -347,7 +378,8 @@ def main():
 Examples:
   %(prog)s input.mp4 output.mp4
   %(prog)s video.mp4 ascii.mp4 --detect-green
-  %(prog)s clip.mov final.mp4 --key-color 0x00B140 --tolerance 0.3
+  %(prog)s clip.mov final.mp4 --leave-black-empty
+  %(prog)s clip.mov final.mp4 --leave-black-empty --black-threshold 60
         """
     )
 
@@ -369,6 +401,10 @@ Examples:
                         help='ASCII line width in chars (default: 160)')
     parser.add_argument('--colorized', action='store_true',
                         help='Output colored ASCII instead of monochrome')
+    parser.add_argument('--leave-black-empty', action='store_true',
+                        help='Leave black areas as truly empty (no ASCII characters)')
+    parser.add_argument('--black-threshold', type=int, default=50,
+                        help='Brightness threshold for considering pixel "black" (0-255, default: 50)')
     parser.add_argument('--keep-temp', action='store_true',
                         help='Keep temporary files after processing')
     parser.add_argument('--silent-progress', action='store_true',
@@ -399,7 +435,7 @@ Examples:
         print("="*60 + "\n")
 
         # Stage 1: Detect green color or use provided/default
-        print("[1/6] Green color selection...")
+        print("[1/7] Green color selection...")
 
         if args.detect_green or args.key_color is None:
             detected_color, was_detected = sample_green_color(input_path)
@@ -414,7 +450,7 @@ Examples:
         print()
 
         # Stage 2: Probe input video
-        print("[2/6] Probing input video...")
+        print("[2/7] Probing input video...")
         video_info = probe_video(input_path)
         width, height, fps, has_audio = (
             video_info['width'], video_info['height'],
@@ -427,7 +463,7 @@ Examples:
         print()
 
         # Stage 3: Chromakey to black
-        print("[3/6] Applying chromakey and compositing over black...")
+        print("[3/7] Applying chromakey and compositing over black...")
         chroma_output = temp_dir / 'chroma_keyed.mp4'
         with tqdm(total=1, desc="  Processing video", disable=tqdm_disabled) as pbar:
             chromakey_to_black(input_path, chroma_output, key_color,
@@ -436,24 +472,36 @@ Examples:
         print(f"  Output: {chroma_output}")
         print()
 
-        # Stage 4: Extract frames
-        print("[4/6] Extracting frames...")
+        # Stage 4: Extract frames and masks
+        print("[4/7] Extracting frames...")
         frames_dir = temp_dir / 'frames'
-        frames = extract_frames(chroma_output, frames_dir, fps, args.scale_divisor)
-        print(f"  Extracted {len(frames)} frames to {frames_dir}")
+        mask_dir = temp_dir / 'masks'
+        frames, masks = extract_frames_with_masks(chroma_output, frames_dir, mask_dir,
+                                                   fps, args.scale_divisor)
         print()
 
         # Stage 5: Convert to ASCII text
-        print("[5/6] Converting frames to ASCII...")
+        print("[5/7] Converting frames to ASCII...")
         txt_dir = temp_dir / 'txt_frames'
         ascii_files = convert_frames_to_ascii(frames, txt_dir, args.ascii_width, args.colorized)
         print(f"  Created {len(ascii_files)} ASCII files in {txt_dir}")
         print()
 
-        # Stage 6: Render ASCII to images and assemble video
-        print("[6/6] Rendering ASCII to images and assembling video...")
+        # Stage 6: Render ASCII to images
+        print("[6/7] Rendering ASCII to images...")
         img_dir = temp_dir / 'images'
-        rendered_images = render_ascii_to_images(ascii_files, img_dir)
+        use_masks = args.leave_black_empty and len(masks) > 0
+        rendered_images = render_ascii_to_images(
+            ascii_files, img_dir, masks if use_masks else None,
+            use_masks=use_masks, black_threshold=args.black_threshold
+        )
+        if use_masks:
+            print(f"  Black areas will remain empty (threshold: {args.black_threshold})")
+        print(f"  Rendered {len(rendered_images)} images in {img_dir}")
+        print()
+
+        # Stage 7: Assemble video
+        print("[7/7] Assembling final video...")
         assemble_video(rendered_images, output_path, fps, input_path)
         print(f"  Final output: {output_path}")
         print()
@@ -463,6 +511,8 @@ Examples:
         print("="*60)
         print(f"\nUsed chromakey color: {key_color}" + (" (auto-detected)" if was_detected else ""))
         print(f"Parameters: tolerance={args.tolerance}, edge_blending={args.edge_blending}")
+        if args.leave_black_empty:
+            print(f"Black areas: Left empty (threshold: {args.black_threshold})")
         if not args.keep_temp:
             print(f"Temporary files cleaned up from: {temp_dir}")
         print()
