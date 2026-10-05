@@ -528,7 +528,7 @@ Examples:
         print("="*60 + "\n")
 
        # Stage 1: Probe input video FIRST (get dimensions for color sampling)
-        print("[1/7] Probing input video...")
+        print("[1/6] Probing input video...")
         video_info = probe_video(input_path)
         width, height, fps, has_audio = (
             video_info['width'], video_info['height'],
@@ -550,7 +550,7 @@ Examples:
         print("[2/7] Green color selection...")
 
         if args.no_key:
-            print("[2/7] Skipping key color detection (--no-key)")
+            print("[2/6] Skipping key color detection (--no-key)")
             key_color, was_detected = 'N/A', False
         elif args.detect_green or args.key_color is None:
             detected_color, was_detected = sample_green_color(
@@ -568,7 +568,7 @@ Examples:
 
         # Stage 3: Chromakey to black (or bypass)
         if args.no_key:
-            print("[3/7] Skipping chromakey (--no-key)")
+            print("[3/6] Skipping chromakey (--no-key)")
             chroma_output = input_path
         else:
             print("[3/7] Applying chromakey and compositing over black...")
