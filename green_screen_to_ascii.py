@@ -173,11 +173,12 @@ def chromakey_to_black(input_path, output_path, key_color, tolerance, edge_blend
     run_command(cmd, check=True)
     return output_path
 
-def extract_frames(video_path, frames_dir, target_fps=None, scale_divisor=8):
-    """Extract frames from the chromakeyed video."""
+def extract_frames(video_path, frames_dir, target_fps=None, ascii_width=240):
+    """Extract frames at exactly the ASCII character-grid width (1:1 pixel mapping)."""
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    scale_filter = f'scale=iw/{scale_divisor}:-1,fps={target_fps}'
+    # Scale to the exact character count; -2 keeps even height
+    scale_filter = f'scale={ascii_width}:-2:flags=lanczos,fps={target_fps}'
 
     cmd = [
         'ffmpeg', '-y', '-i', str(video_path),
@@ -550,8 +551,15 @@ Examples:
 
         # Stage 4: Extract frames
         print("[4/6] Extracting frames...")
+        # ASCII width: explicit, or derived from source width / scale divisor
+        if args.ascii_width is None:
+            args.ascii_width = max(width // args.scale_divisor, 20)
+        elif not args.no_key or True:
+            print(f"  Note: extracting frames at {args.ascii_width}px wide "
+                  f"for 1:1 character mapping")
+
         frames_dir = temp_dir / 'frames'
-        frames = extract_frames(chroma_output, frames_dir, fps, args.scale_divisor)
+        frames = extract_frames(chroma_output, frames_dir, fps, args.ascii_width)
         print()
 
         # Stage 5: Convert to ASCII text
