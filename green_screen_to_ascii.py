@@ -262,16 +262,15 @@ def load_monospace_font(font_size=12):
     except TypeError:
         return ImageFont.load_default()
 
-
 def render_ascii_to_images(ascii_files, frame_images, img_dir,
                            leave_black_empty=False, black_threshold=50,
-                           target_width=1920, target_height=1080,  # <- Changed to target
-                           source_width=1920, source_height=1080,  # <- Added for mask mapping
-                           font_size=24):
-    """Render ASCII text as images at TARGET resolution.
+                           target_width=1920, target_height=1080,
+                           base_font_size=64):
+    """Render ASCII at the TARGET resolution with exact integer cells.
 
-    Character sizing is based on target, not source, ensuring consistency
-    across videos of different resolutions when processed together.
+    Character cell geometry derives from target_width and the measured
+    column count only — so any two clips rendered with the same target
+    and same effective --ascii-width have identical character geometry.
     """
     try:
         from PIL import Image, ImageDraw
@@ -280,15 +279,9 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
         sys.exit(1)
 
     img_dir.mkdir(parents=True, exist_ok=True)
-    font = load_monospace_font(font_size)
+    font = load_monospace_font(base_font_size)
 
-    # Font-derived integer cell metrics (native)
-    ascent, descent = font.getmetrics()
-    line_h = ascent + descent
-    bbox = font.getbbox("M")
-    char_w = (bbox[2] - bbox[0]) or 6
-
-    # Pre-scan: fixed grid size across ALL frames
+    # --- Pre-scan: fixed grid measured across ALL frames ---
     max_cols, max_rows = 0, 0
     for af in ascii_files:
         with open(af, 'r') as f:
@@ -298,30 +291,28 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
     if max_cols == 0 or max_rows == 0:
         raise ValueError("No ASCII content found in any frame")
 
-    # GRID CANVAS = TARGET RESOLUTION (NOT source)
-    grid_w = target_width
-    grid_h = target_height
+    # --- Integer cell math on the TARGET (never the source) ---
+    cell_w = max(1, target_width // max_cols)       # floor → never fractional
+    cell_h = max(1, target_height // max_rows)
+    grid_w = cell_w * max_cols                       # ≤ target_width
+    grid_h = cell_h * max_rows                       # ≤ target_height
+    off_x = (target_width - grid_w) // 2              # symmetric slack
+    off_y = (target_height - grid_h) // 2
 
-    # Cell dimensions derived from TARGET (not source)
-    cell_w = grid_w / max_cols
-    cell_h = grid_h / max_rows
-    glyph_w = max(1, int(round(cell_w)))
-    glyph_h = max(1, int(round(cell_h)))
-
-    # Cache glyphs at target-appropriate size
+    # Render glyphs once, scaled to exactly one cell (integer size)
     glyph_cache = {}
     def get_glyph(ch):
         if ch not in glyph_cache:
-            bbox = font.getbbox(ch)
-            gw = max(1, bbox[2] - bbox[0])
-            gh = max(1, bbox[3] - bbox[1])
+            b = font.getbbox(ch)
+            gw = max(1, b[2] - b[0])
+            gh = max(1, b[3] - b[1])
             gi = Image.new('RGBA', (gw, gh), (0, 0, 0, 0))
-            ImageDraw.Draw(gi).text((-bbox[0], -bbox[1]), ch,
+            ImageDraw.Draw(gi).text((-b[0], -b[1]), ch,
                                     font=font, fill=(100, 255, 100))
-            glyph_cache[ch] = gi.resize((glyph_w, glyph_h), Image.LANCZOS)
+            glyph_cache[ch] = gi.resize((cell_w, cell_h), Image.LANCZOS)
         return glyph_cache[ch]
 
-    blank = Image.new('RGB', (grid_w, grid_h), 'black')
+    blank = Image.new('RGB', (target_width, target_height), 'black')
     rendered_images = []
 
     for i, ascii_file in enumerate(tqdm(ascii_files, desc="  Rendering images", unit="frame")):
@@ -331,10 +322,14 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
             text = f.read()
         lines = text.rstrip('\n').split('\n')
 
+        # Blank frame → solid black at exact target size
         if not any(l.strip() for l in lines):
             blank.save(out_path)
             rendered_images.append(out_path)
             continue
+
+        # Normalize to the measured grid
+        lines = [l.ljust(max_cols)[:max_cols] for l in lines]
 
         luminance_map = {}
         pil_img = None
@@ -348,33 +343,32 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
             except Exception as e:
                 print(f"  Warning: Could not load frame {i}: {e}")
 
-        num_rows = max(len(lines), 1)
-
-        img = Image.new('RGB', (grid_w, grid_h), 'black')
+        img = blank.copy()   # target-sized canvas, no final resize needed
 
         for y, line in enumerate(lines):
+            if y >= max_rows:
+                break
             for x, ch in enumerate(line):
                 if ch == ' ':
                     continue
 
                 if leave_black_empty and luminance_map and pil_img:
-                    # Map grid coords → SOURCE frame (not target!)
                     px = min(int(((x + 0.5) / max_cols) * pil_img.width),
                              pil_img.width - 1)
-                    py = min(int(((y + 0.5) / num_rows) * pil_img.height),
+                    py = min(int(((y + 0.5) / max_rows) * pil_img.height),
                              pil_img.height - 1)
                     if luminance_map.get((px, py), 255) < black_threshold:
                         continue
 
                 glyph = get_glyph(ch)
-                img.paste(glyph, (int(x * cell_w), int(y * cell_h)), glyph)
+                img.paste(glyph, (off_x + x * cell_w, off_y + y * cell_h), glyph)
 
         img.save(out_path)
         rendered_images.append(out_path)
 
-    print(f"  Grid: {max_cols}x{max_rows} chars @ {grid_w}x{grid_h} (target)")
+    print(f"  Grid: {max_cols}x{max_rows}, cell={cell_w}x{cell_h}px, "
+          f"canvas={target_width}x{target_height} (target)")
     return rendered_images
-
 
 def assemble_video(rendered_images, output_path, fps, source_video):
     """Assemble rendered frames into the final video."""
@@ -580,11 +574,9 @@ Examples:
             ascii_files, frames, img_dir,
             leave_black_empty=args.leave_black_empty,
             black_threshold=args.black_threshold,
-            source_width=width,
-            source_height=height,
             target_width=tw,
             target_height=th,
-            font_size=args.render_font_size
+            base_font_size=args.render_font_size
         )
         if args.leave_black_empty:
             print(f"  Black areas: Left empty (threshold: {args.black_threshold})")
