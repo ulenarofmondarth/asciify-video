@@ -508,7 +508,7 @@ Examples:
     parser.add_argument('--no-key', action='store_true',
                         help='Skip chromakey stage entirely (video already keyed/black background)')
     parser.add_argument('--ramp', type=str, default=None,
-                        help='Either jp2a (to emulate rp2a ramp) or a specific ramp')
+                        help='Either jp2a (to emulate jp2a ramp) or a specific ramp')
     parser.add_argument('--sample-region', type=str, default='corners',
                         help='Where to sample for key color detection: corners, center, full, '
                              'or custom WxH+X+Y in source pixels (default: corners)')
