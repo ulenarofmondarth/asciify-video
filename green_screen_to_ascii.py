@@ -27,18 +27,23 @@ def run_command(cmd, check=True):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return result
 
-def sample_green_color(input_path, sample_frames=10):
-    """Sample multiple frames and find dominant non-black/non-white color in center area."""
-    print(f"  Sampling {sample_frames} frames for green color detection...")
+def sample_green_color(input_path, sample_frames=10, region='corners', src_width=300, src_height=300):
+    """Sample frames and detect a green key color.
+
+    region options:
+      corners  – four corner boxes (best for green-screen footage; default)
+      center   – center third (best if subject is off-center/screen fills edges)
+      full     – entire frame
+      WxH+X+Y  – custom crop box in original pixels, e.g. 200x150+0+0
+    """
+    print(f"  Sampling {sample_frames} frames ({region} region) for green color detection...")
 
     try:
         probe_cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_entries', 'format=duration',
-            str(input_path)
+            '-show_entries', 'format=duration', str(input_path)
         ]
-        info = json.loads(run_command(probe_cmd).stdout)
-        duration = float(info['format']['duration'])
+        duration = float(json.loads(run_command(probe_cmd).stdout)['format']['duration'])
 
         start_time = duration * 0.25
         interval = (duration * 0.5) / sample_frames
@@ -49,35 +54,56 @@ def sample_green_color(input_path, sample_frames=10):
             for i in range(sample_frames):
                 sample_time = start_time + (interval * i)
 
+                # Grab full frame at reduced scale — raw RGB, no crops
                 cmd = [
                     'ffmpeg', '-y',
                     '-ss', str(sample_time),
                     '-i', str(input_path),
                     '-frames:v', '1',
-                    '-vf', 'crop=iw/3:ih/3:iw/3:ih/3',
-                    '-f', 'rawvideo',
-                    '-pix_fmt', 'rgb24',
-                    '-'
+                    '-vf', 'scale=160:-2',
+                    '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'
                 ]
-
                 result = subprocess.run(cmd, capture_output=True)
-                if result.returncode != 0:
+                if result.returncode != 0 or len(result.stdout) < 3:
+                    pbar.update(1)
                     continue
 
                 data = result.stdout
-                num_pixels = len(data) // 3
+                fw = 160
+                fh = (len(data) // 3) // fw
+                if fh == 0:
+                    pbar.update(1)
+                    continue
 
-                for j in range(0, min(num_pixels, 1000), 10):
-                    r = data[j]
-                    g = data[j + 1]
-                    b = data[j + 2]
+                def in_region(px, py):
+                    if region == 'full':
+                        return True
+                    if region == 'center':
+                        return (fw/3 <= px < 2*fw/3) and (fh/3 <= py < 2*fh/3)
+                    if region == 'corners':
+                        bw, bh = fw // 6, fh // 6
+                        return (px < bw or px >= fw - bw) and (py < bh or py >= fh - bh)
+                    # Custom WxH+X+Y in source pixels → map to scaled frame
+                    import re
+                    m = re.match(r'^(\d+)x(\d+)\+(\d+)\+(\d+)$', region)
+                    if not m:
+                        raise ValueError(f"Invalid region spec: {region}")
+                    cw, ch, cx, cy = (int(v) for v in m.groups())
+                    sx, sy = px * src_width / fw, py * src_height / fh
+                    return (cx <= sx < cx + cw) and (cy <= sy < cy + ch)
 
-                    brightness = (r + g + b) / 3
-                    if brightness < 30 or brightness > 220:
-                        continue
+                for py in range(fh):
+                    for px in range(fw):
+                        if not in_region(px, py):
+                            continue
+                        j = (py * fw + px) * 3
+                        r, g, b = data[j], data[j+1], data[j+2]
 
-                    if g > r and g > b and g - r > 30 and g - b > 30:
-                        rgb_values.append((r, g, b))
+                        brightness = (r + g + b) / 3
+                        if brightness < 30 or brightness > 220:
+                            continue
+                        if g > r and g > b and g - r > 30 and g - b > 30:
+                            rgb_values.append((r, g, b))
 
                 pbar.update(1)
 
@@ -97,6 +123,7 @@ def sample_green_color(input_path, sample_frames=10):
         print(f"  Error detecting green color: {e}")
         print("  Falling back to default chroma-key green (0x00FF00)")
         return '0x00FF00', False
+
 
 def probe_video(filepath):
     """Extract video info using ffprobe."""
@@ -432,6 +459,11 @@ Examples:
                         help='Keep temporary files after processing')
     parser.add_argument('--silent-progress', action='store_true',
                         help='Suppress progress bars (useful for logging)')
+    parser.add_argument('--no-key', action='store_true',
+                        help='Skip chromakey stage entirely (video already keyed/black background)')
+    parser.add_argument('--sample-region', type=str, default='corners',
+                        help='Where to sample for key color detection: corners, center, full, '
+                             'or custom WxH+X+Y in source pixels (default: corners)')
 
     args = parser.parse_args()
 
@@ -454,11 +486,35 @@ Examples:
         print("GREEN SCREEN TO ASCII VIDEO CONVERTER")
         print("="*60 + "\n")
 
-        # Stage 1: Detect green color
-        print("[1/6] Green color selection...")
+       # Stage 1: Probe input video FIRST (get dimensions for color sampling)
+        print("[1/7] Probing input video...")
+        video_info = probe_video(input_path)
+        width, height, fps, has_audio = (
+            video_info['width'], video_info['height'],
+            video_info['fps'], video_info['has_audio']
+        )
+        fps = args.fps if args.fps else fps
 
-        if args.detect_green or args.key_color is None:
-            detected_color, was_detected = sample_green_color(input_path)
+        # Compute default ascii width based on scale divisor if not specified
+        if args.ascii_width is None:
+            args.ascii_width = max(width // args.scale_divisor, 20)
+
+        print(f"  Resolution: {width}x{height}")
+        print(f"  Frame rate: {fps:.2f} fps")
+        print(f"  Audio: {'Yes' if has_audio else 'No'}")
+        print(f"  ASCII width: {args.ascii_width} chars")
+        print()
+
+        # Stage 2: Detect green color (now we have dimensions to pass)
+        print("[2/7] Green color selection...")
+
+        if args.no_key:
+            print("[2/7] Skipping key color detection (--no-key)")
+            key_color, was_detected = 'N/A', False
+        elif args.detect_green or args.key_color is None:
+            detected_color, was_detected = sample_green_color(
+                input_path, region=args.sample_region,
+                src_width=width, src_height=height)
             key_color = detected_color
         else:
             key_color = args.key_color
@@ -469,27 +525,18 @@ Examples:
             print("  (Auto-detected from input video)")
         print()
 
-        # Stage 2: Probe input video
-        print("[2/6] Probing input video...")
-        video_info = probe_video(input_path)
-        width, height, fps, has_audio = (
-            video_info['width'], video_info['height'],
-            video_info['fps'], video_info['has_audio']
-        )
-        fps = args.fps if args.fps else fps
-        print(f"  Resolution: {width}x{height}")
-        print(f"  Frame rate: {fps:.2f} fps")
-        print(f"  Audio: {'Yes' if has_audio else 'No'}")
-        print()
-
-        # Stage 3: Chromakey to black
-        print("[3/6] Applying chromakey and compositing over black...")
-        chroma_output = temp_dir / 'chroma_keyed.mp4'
-        with tqdm(total=1, desc="  Processing video", disable=tqdm_disabled) as pbar:
-            chromakey_to_black(input_path, chroma_output, key_color,
-                               args.tolerance, args.edge_blending, width, height, fps)
-            pbar.update(1)
-        print(f"  Output: {chroma_output}")
+        # Stage 3: Chromakey to black (or bypass)
+        if args.no_key:
+            print("[3/7] Skipping chromakey (--no-key)")
+            chroma_output = input_path
+        else:
+            print("[3/7] Applying chromakey and compositing over black...")
+            chroma_output = temp_dir / 'chroma_keyed.mp4'
+            with tqdm(total=1, desc="  Processing video", disable=tqdm_disabled) as pbar:
+                chromakey_to_black(input_path, chroma_output, key_color,
+                                   args.tolerance, args.edge_blending, width, height, fps)
+                pbar.update(1)
+            print(f"  Output: {chroma_output}")
         print()
 
         # Stage 4: Extract frames
@@ -545,3 +592,4 @@ Examples:
 
 if __name__ == '__main__':
     main()
+
