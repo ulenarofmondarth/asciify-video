@@ -193,62 +193,70 @@ def extract_frames(video_path, frames_dir, target_fps=None, ascii_width=240):
     print(f"  Extracted {len(frames)} frames to {frames_dir}")
     return frames
 
-def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
-    """Convert frames to ASCII via direct luminance mapping (no jp2a)."""
+def compute_global_stretch(frames, sample_step=10, percentile=0.5):
+    """Compute global lo/hi luminance bounds from sampled frames.
+
+    Uses mild percentile clipping so a handful of outlier pixels
+    (specular highlights, noise) don't dominate the stretch.
+    """
+    from PIL import Image
+    vals = []
+    for frame in frames[::sample_step]:
+        img = Image.open(frame).convert('L')
+        vals.extend(list(img.getdata()))
+    if not vals:
+        return 0, 255
+    vals.sort()
+    n = len(vals)
+    lo = vals[int(n * percentile / 100)]
+    hi = vals[min(n - 1, int(n * (100 - percentile) / 100))]
+    # Guard against degenerate ranges
+    if hi - lo < 16:
+        lo, hi = 0, 255
+    return lo, hi
+
+
+def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False,
+                           stretch=None):
+    """Convert frames to ASCII via direct luminance mapping.
+
+    stretch: None for no stretch (default), or a (lo, hi) tuple for
+    histogram stretching before character mapping.
+    """
     from PIL import Image
     txt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Light (space) -> dense (@); mirrors the ramp jp2a uses
     ramp = " .',;:clodxkO0KXNWM"
     #ramp = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
     ascii_files = []
+
+    scale = len(ramp) / 256
 
     for frame in tqdm(frames, desc="  Converting to ASCII", unit="frame"):
         txt_file = txt_dir / f'{frame.stem}.txt'
         img = Image.open(frame).convert('L')
         w, h = img.size
-        # Character cells are ~2:1 (taller than wide): halve the rows
         rows = max(1, h // 2)
-        # Frames are already `width` px wide after the extraction fix;
-        # the resize below is an identity in that case
         img = img.resize((width, rows), Image.LANCZOS)
 
-        scale = len(ramp) / 256
+        pixels = list(img.getdata())
+
+        if stretch is not None:
+            lo, hi = stretch
+            span = max(hi - lo, 1)
+            # Stretch into 0..255, clamped
+            pixels = [min(255, max(0, (p - lo) * 255 // span)) for p in pixels]
+
+        pw = width
         with open(txt_file, 'w') as f:
             for y in range(rows):
-                line = ''.join(
-                    ramp[min(len(ramp) - 1, int(img.getpixel((x, y)) * scale))]
-                    for x in range(width))
-                f.write(line + '\n')
+                row = pixels[y * pw:(y + 1) * pw]
+                f.write(''.join(
+                    ramp[min(len(ramp) - 1, int(p * scale))] for p in row))
+                f.write('\n')
         ascii_files.append(txt_file)
 
     return ascii_files
-
-#def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
-#    """Convert each PNG frame to ASCII text using jp2a."""
-#    txt_dir.mkdir(parents=True, exist_ok=True)
-#
-#    ascii_files = []
-#
-#    jp2a_args = [f'--width={width}']
-#    if colorized:
-#        jp2a_args.append('--colors')
-#
-#    for i, frame in enumerate(tqdm(frames, desc="  Converting to ASCII", unit="frame")):
-#        txt_file = txt_dir / f'{str(frame.stem)}.txt'
-#
-#        cmd = ['jp2a'] + jp2a_args + [str(frame)]
-#
-#        result = subprocess.run(cmd, capture_output=True, text=True)
-#        if result.returncode != 0:
-#            print(f"\nWarning: jp2a failed for {frame.name}")
-#            continue
-#
-#        with open(txt_file, 'w') as f:
-#            f.write(result.stdout)
-#        ascii_files.append(txt_file)
-#
-#    return ascii_files
 
 
 def load_monospace_font(font_size=12):
@@ -505,6 +513,10 @@ Examples:
                         help='Target output resolution WIDTHxHEIGHT (e.g., 1920x1080). '
                              'All outputs are resized to this, ensuring consistent '
                              'character sizing across videos of different resolutions.')
+    parser.add_argument('--hist-stretch', action='store_true',
+                        help='Stretch the luminance histogram (global, '
+                             'computed across the whole video) before '
+                             'mapping to characters (default: no stretch)')
 
     args = parser.parse_args()
 
@@ -596,7 +608,16 @@ Examples:
         # Stage 5: Convert to ASCII text
         print("[5/6] Converting frames to ASCII...")
         txt_dir = temp_dir / 'txt_frames'
-        ascii_files = convert_frames_to_ascii(frames, txt_dir, args.ascii_width, args.colorized)
+
+        stretch = None
+        if args.hist_stretch:
+            print("  Computing global histogram bounds...")
+            stretch = compute_global_stretch(frames)
+            print(f"  Stretch range: {stretch[0]}-{stretch[1]} "
+                  f"(gain x{255 / max(stretch[1] - stretch[0], 1):.2f})")
+
+
+        ascii_files = convert_frames_to_ascii(frames, txt_dir, args.ascii_width, args.colorized, stretch=stretch)
         print(f"  Created {len(ascii_files)} ASCII files in {txt_dir}")
         print()
 
