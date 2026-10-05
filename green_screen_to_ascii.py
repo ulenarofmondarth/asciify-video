@@ -191,57 +191,104 @@ def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
 
     return ascii_files
 
+
+def load_monospace_font(font_size=12):
+    """Find a usable monospace font across platforms."""
+    from PIL import ImageFont
+
+    candidates = [
+        # Linux
+        '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+        '/usr/share/fonts/TTF/DejaVuSansMono.ttf',
+        '/usr/share/fonts/liberation/LiberationMono-Regular.ttf',
+        # Windows
+        'C:/Windows/Fonts/consola.ttf',
+        # macOS (current layout)
+        '/System/Library/Fonts/Supplemental/Courier New.ttf',
+        '/System/Library/Fonts/Menlo.ttc',
+        '/System/Library/Fonts/SFNSMono.ttf',
+    ]
+
+    for fp in candidates:
+        try:
+            return ImageFont.truetype(fp, font_size)
+        except OSError:
+            continue
+
+    # Last resort: sweep system font dirs
+    import glob
+    patterns = [
+        '/System/Library/Fonts/**/*.tt[fc]', '/Library/Fonts/**/*.tt[fc]',
+        '/usr/share/fonts/**/*.tt[fc]', '/usr/local/share/fonts/**/*.tt[fc]',
+    ]
+    for pat in patterns:
+        for fp in sorted(glob.glob(pat, recursive=True))[:50]:
+            try:
+                return ImageFont.truetype(fp, font_size)
+            except OSError:
+                continue
+
+    # Pillow >= 10.1: load_default accepts a size and returns a proper
+    # scalable font (unlike the crashing legacy bitmap font)
+    try:
+        return ImageFont.load_default(size=font_size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def render_ascii_to_images(ascii_files, frame_images, img_dir, font_size=12,
                            leave_black_empty=False, black_threshold=50):
     """Render ASCII text files as images with optional black-is-empty logic."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
     except ImportError:
         print("Error: Pillow (PIL) is required. Install with: pip install Pillow")
         sys.exit(1)
 
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # Configure font - use monospaced font
-    try:
-        font_paths = [
-            '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf',
-            '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
-            '/usr/share/fonts/TTF/DejaVuSansMono.ttf',
-            '/usr/share/fonts/liberation/LiberationMono-Regular.ttf',
-            'C:/Windows/Fonts/consola.ttf',
-            '/System/Library/Fonts/Monaco.dfont',
-            'monospace'
-        ]
-        font = None
-        for fp in font_paths:
-            try:
-                font = ImageFont.truetype(fp, font_size)
-                break
-            except (OSError, IOError):
-                continue
-        if font is None:
-            font = ImageFont.load_default()
-            print("Using default font (may not be monospace)")
-    except Exception as e:
-        font = ImageFont.load_default()
-        print(f"Could not load custom font: {e}. Using default.")
+    font = load_monospace_font(font_size)
+
+    # Derive the character cell from actual font metrics instead of
+    # hard-coding 8x16
+    ascent, descent = font.getmetrics()
+    char_height = ascent + descent
+    bbox = font.getbbox("M")
+    char_width = bbox[2] - bbox[0] or 6   # advance width of a mono char
+
 
     rendered_images = []
-    char_width = 8
-    char_height = 16
+
+   # Pre-scan: determine the canvas size from ALL frames so blank
+    # frames can still be emitted at the right size
+    max_cols = 0
+    max_rows = 0
+    for af in ascii_files:
+        with open(af, 'r') as f:
+            lines = f.read().rstrip('\n').split('\n')
+        if lines == ['']:
+            continue
+        max_cols = max(max_cols, max((len(l) for l in lines), default=0))
+        max_rows = max(max_rows, len(lines))
+
+    img_width = max(max_cols * char_width, 1)
+    img_height = max(max_rows * char_height, 1)
 
     for i, ascii_file in enumerate(tqdm(ascii_files, desc="  Rendering images", unit="frame")):
+        out_path = img_dir / f'rendered_{str(ascii_file.stem).zfill(6)}.png'
+
         with open(ascii_file, 'r') as f:
             text = f.read()
 
-        lines = text.strip().split('\n')
-        if not lines:
-            continue
+        lines = text.rstrip('\n').split('\n')
 
-        max_line_len = max(len(line) for line in lines)
-        img_width = max_line_len * char_width
-        img_height = len(lines) * char_height
+        # Blank frame (nothing but background): emit solid black to
+        # preserve frame timing
+        if not any(l.strip() for l in lines):
+            img = Image.new('RGB', (img_width, img_height), color='black')
+            img.save(out_path)
+            rendered_images.append(out_path)
+            continue
 
         # Create black image
         img = Image.new('RGB', (img_width, img_height), color='black')
@@ -262,28 +309,47 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir, font_size=12,
                 print(f"  Warning: Could not load frame {i} for luminance check: {e}")
 
         # Draw ASCII text with optional luminance masking
+        num_rows = len(lines)
         for y, line in enumerate(lines):
+            num_cols = len(line)
             for x, char in enumerate(line):
                 if char == ' ':
-                    continue  # Skip spaces anyway
+                    continue
 
                 if leave_black_empty and luminance_map:
-                    # Map character grid position to frame pixel position
-                    # Each char represents a block of pixels from the scaled frame
-                    pixel_x = min(x, pil_img.width - 1)
-                    pixel_y = min(y, pil_img.height - 1)
+                    # Map character cell center → frame pixel, proportionally
+                    px = int(((x + 0.5) / num_cols) * pil_img.width)
+                    py = int(((y + 0.5) / num_rows) * pil_img.height)
+                    px = min(px, pil_img.width - 1)
+                    py = min(py, pil_img.height - 1)
 
-                    mask_pixel = luminance_map.get((pixel_x, pixel_y), 0)
-
-                    # If pixel is below threshold, skip drawing (keep black)
-                    if mask_pixel < black_threshold:
+                    if luminance_map.get((px, py), 255) < black_threshold:
                         continue
 
-                # Draw the character
-                char_x = x * char_width
-                char_y = y * char_height
-                draw.text((char_x, char_y), char, fill=(100, 255, 100), font=font)
-
+                draw.text((x * char_width, y * char_height), char,
+                          fill=(100, 255, 100), font=font)
+#        for y, line in enumerate(lines):
+#            for x, char in enumerate(line):
+#                if char == ' ':
+#                    continue  # Skip spaces anyway
+#
+#                if leave_black_empty and luminance_map:
+#                    # Map character grid position to frame pixel position
+#                    # Each char represents a block of pixels from the scaled frame
+#                    pixel_x = min(x, pil_img.width - 1)
+#                    pixel_y = min(y, pil_img.height - 1)
+#
+#                    mask_pixel = luminance_map.get((pixel_x, pixel_y), 0)
+#
+#                    # If pixel is below threshold, skip drawing (keep black)
+#                    if mask_pixel < black_threshold:
+#                        continue
+#
+#                # Draw the character
+#                char_x = x * char_width
+#                char_y = y * char_height
+#                draw.text((char_x, char_y), char, fill=(100, 255, 100), font=font)
+#
         out_path = img_dir / f'rendered_{str(ascii_file.stem).zfill(6)}.png'
         img.save(out_path)
         rendered_images.append(out_path)
