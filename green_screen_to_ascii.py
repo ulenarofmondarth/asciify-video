@@ -216,7 +216,7 @@ def compute_global_stretch(frames, sample_step=10, percentile=0.5):
     return lo, hi
 
 
-def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False,
+def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False, ramp=None,
                            stretch=None):
     """Convert frames to ASCII via direct luminance mapping.
 
@@ -226,8 +226,11 @@ def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False,
     from PIL import Image
     txt_dir.mkdir(parents=True, exist_ok=True)
 
-    ramp = " .',;:clodxkO0KXNWM"
-    #ramp = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+    if ramp is None:
+        ramp = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+    if ramp == 'jp2a':
+        ramp = " .',;:clodxkO0KXNWM"
+
     ascii_files = []
 
     scale = len(ramp) / 256
@@ -504,6 +507,8 @@ Examples:
                         help='Suppress progress bars (useful for logging)')
     parser.add_argument('--no-key', action='store_true',
                         help='Skip chromakey stage entirely (video already keyed/black background)')
+    parser.add_argument('--ramp', type=str, default=None,
+                        help='Either jp2a (to emulate rp2a ramp) or a specific ramp')
     parser.add_argument('--sample-region', type=str, default='corners',
                         help='Where to sample for key color detection: corners, center, full, '
                              'or custom WxH+X+Y in source pixels (default: corners)')
@@ -617,7 +622,7 @@ Examples:
                   f"(gain x{255 / max(stretch[1] - stretch[0], 1):.2f})")
 
 
-        ascii_files = convert_frames_to_ascii(frames, txt_dir, args.ascii_width, args.colorized, stretch=stretch)
+        ascii_files = convert_frames_to_ascii(frames, txt_dir, args.ascii_width, args.colorized, args.ramp, stretch=stretch)
         print(f"  Created {len(ascii_files)} ASCII files in {txt_dir}")
         print()
 
