@@ -198,7 +198,7 @@ def convert_frames_to_ascii(frames, txt_dir, width=160, colorized=False):
 
     ascii_files = []
 
-    jp2a_args = ['--width=160']
+    jp2a_args = [f'--width={width}']
     if colorized:
         jp2a_args.append('--colors')
 
@@ -263,9 +263,17 @@ def load_monospace_font(font_size=12):
         return ImageFont.load_default()
 
 
-def render_ascii_to_images(ascii_files, frame_images, img_dir, font_size=12,
-                           leave_black_empty=False, black_threshold=50):
-    """Render ASCII text files as images with optional black-is-empty logic."""
+def render_ascii_to_images(ascii_files, frame_images, img_dir,
+                           leave_black_empty=False, black_threshold=50,
+                           input_width=1920, input_height=1080,
+                           base_font_size=64):
+    """Render ASCII text as images that EXACTLY match input dimensions.
+
+    A fixed character grid (pre-scanned across all frames) is mapped onto
+    the input resolution, and each character is pre-rendered once and
+    stretched to exactly one cell. Character size is therefore identical
+    across all frames and all videos of the same resolution.
+    """
     try:
         from PIL import Image, ImageDraw
     except ImportError:
@@ -273,148 +281,128 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir, font_size=12,
         sys.exit(1)
 
     img_dir.mkdir(parents=True, exist_ok=True)
+    font = load_monospace_font(base_font_size)   # larger = crisper downscale
 
-    font = load_monospace_font(font_size)
-
-    # Derive the character cell from actual font metrics instead of
-    # hard-coding 8x16
-    ascent, descent = font.getmetrics()
-    char_height = ascent + descent
-    bbox = font.getbbox("M")
-    char_width = bbox[2] - bbox[0] or 6   # advance width of a mono char
-
-
-    rendered_images = []
-
-   # Pre-scan: determine the canvas size from ALL frames so blank
-    # frames can still be emitted at the right size
-    max_cols = 0
-    max_rows = 0
+    # --- Pre-scan: fixed grid size across ALL frames ---
+    max_cols, max_rows = 0, 0
     for af in ascii_files:
         with open(af, 'r') as f:
             lines = f.read().rstrip('\n').split('\n')
-        if lines == ['']:
-            continue
         max_cols = max(max_cols, max((len(l) for l in lines), default=0))
         max_rows = max(max_rows, len(lines))
+    if max_cols == 0 or max_rows == 0:
+        raise ValueError("No ASCII content found in any frame")
 
-    img_width = max(max_cols * char_width, 1)
-    img_height = max(max_rows * char_height, 1)
+    # --- Map the grid onto the input dimensions ---
+    cell_w = input_width / max_cols
+    cell_h = input_height / max_rows
+    glyph_w = max(1, int(round(cell_w)))
+    glyph_h = max(1, int(round(cell_h)))
+
+    # --- Pre-render each distinct character once, scaled to one cell ---
+    glyph_cache = {}
+
+    def get_glyph(ch):
+        if ch not in glyph_cache:
+            bbox = font.getbbox(ch)
+            gw = max(1, bbox[2] - bbox[0])
+            gh = max(1, bbox[3] - bbox[1])
+            gi = Image.new('RGBA', (gw, gh), (0, 0, 0, 0))
+            ImageDraw.Draw(gi).text((-bbox[0], -bbox[1]), ch,
+                                    font=font, fill=(100, 255, 100))
+            glyph_cache[ch] = gi.resize((glyph_w, glyph_h), Image.LANCZOS)
+        return glyph_cache[ch]
+
+    blank = Image.new('RGB', (input_width, input_height), 'black')
+    rendered_images = []
 
     for i, ascii_file in enumerate(tqdm(ascii_files, desc="  Rendering images", unit="frame")):
         out_path = img_dir / f'rendered_{str(ascii_file.stem).zfill(6)}.png'
 
         with open(ascii_file, 'r') as f:
             text = f.read()
-
         lines = text.rstrip('\n').split('\n')
 
-        # Blank frame (nothing but background): emit solid black to
-        # preserve frame timing
+        # Blank frame: emit solid black at exact input size
         if not any(l.strip() for l in lines):
-            img = Image.new('RGB', (img_width, img_height), color='black')
-            img.save(out_path)
+            blank.save(out_path)
             rendered_images.append(out_path)
             continue
 
-        # Create black image
-        img = Image.new('RGB', (img_width, img_height), color='black')
-        draw = ImageDraw.Draw(img)
-
-        # Load corresponding frame image for luminance check
+        # Luminance source for --leave-black-empty
         luminance_map = {}
+        pil_img = None
         if leave_black_empty and frame_images and i < len(frame_images):
             try:
-                pil_img = Image.open(frame_images[i]).convert('L')  # Grayscale
+                pil_img = Image.open(frame_images[i]).convert('L')
                 pixels = list(pil_img.getdata())
                 w, h = pil_img.size
-                luminance_map = {}
-                for y in range(h):
-                    for x in range(w):
-                        luminance_map[(x, y)] = pixels[y * w + x]
+                luminance_map = {(x, y): pixels[y * w + x]
+                                 for y in range(h) for x in range(w)}
             except Exception as e:
                 print(f"  Warning: Could not load frame {i} for luminance check: {e}")
 
-        # Draw ASCII text with optional luminance masking
-        num_rows = len(lines)
+        num_rows = max(len(lines), 1)
+
+        img = Image.new('RGB', (input_width, input_height), 'black')
+
         for y, line in enumerate(lines):
-            num_cols = len(line)
-            for x, char in enumerate(line):
-                if char == ' ':
+            for x, ch in enumerate(line):
+                if ch == ' ':
                     continue
 
-                if leave_black_empty and luminance_map:
-                    # Map character cell center → frame pixel, proportionally
-                    px = int(((x + 0.5) / num_cols) * pil_img.width)
-                    py = int(((y + 0.5) / num_rows) * pil_img.height)
-                    px = min(px, pil_img.width - 1)
-                    py = min(py, pil_img.height - 1)
-
+                if leave_black_empty and luminance_map and pil_img:
+                    px = min(int(((x + 0.5) / max_cols) * pil_img.width),
+                             pil_img.width - 1)
+                    py = min(int(((y + 0.5) / num_rows) * pil_img.height),
+                             pil_img.height - 1)
                     if luminance_map.get((px, py), 255) < black_threshold:
                         continue
 
-                draw.text((x * char_width, y * char_height), char,
-                          fill=(100, 255, 100), font=font)
-#        for y, line in enumerate(lines):
-#            for x, char in enumerate(line):
-#                if char == ' ':
-#                    continue  # Skip spaces anyway
-#
-#                if leave_black_empty and luminance_map:
-#                    # Map character grid position to frame pixel position
-#                    # Each char represents a block of pixels from the scaled frame
-#                    pixel_x = min(x, pil_img.width - 1)
-#                    pixel_y = min(y, pil_img.height - 1)
-#
-#                    mask_pixel = luminance_map.get((pixel_x, pixel_y), 0)
-#
-#                    # If pixel is below threshold, skip drawing (keep black)
-#                    if mask_pixel < black_threshold:
-#                        continue
-#
-#                # Draw the character
-#                char_x = x * char_width
-#                char_y = y * char_height
-#                draw.text((char_x, char_y), char, fill=(100, 255, 100), font=font)
-#
-        out_path = img_dir / f'rendered_{str(ascii_file.stem).zfill(6)}.png'
+                glyph = get_glyph(ch)
+                img.paste(glyph, (int(x * cell_w), int(y * cell_h)), glyph)
+
         img.save(out_path)
         rendered_images.append(out_path)
 
+    print(f"  Grid: {max_cols}x{max_rows} chars, cell = {glyph_w}x{glyph_h}px")
     return rendered_images
 
+
 def assemble_video(rendered_images, output_path, fps, source_video):
-    """Assemble rendered frames into final video."""
+    """Assemble rendered frames into the final video."""
     print("  Assembling video...")
+    pattern = str(rendered_images[0].parent / 'rendered_*.png')
 
-    cmd = [
-        'ffmpeg', '-stats', '-y',
-        '-framerate', str(int(fps)),
-        '-pattern_type', 'glob',
-        '-i', str(rendered_images[0].parent / 'rendered_*.png'),
-        '-c:v', 'libx264',
-        '-crf', '18',
-        '-pix_fmt', 'yuv420p',
-        str(output_path)
-    ]
-
-    # Try to preserve audio from original if available
+    # Detect audio on the source
+    has_audio = False
     try:
         probe = json.loads(run_command([
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_streams', source_video
+            '-show_streams', str(source_video)
         ]).stdout)
         has_audio = any(s.get('codec_type') == 'audio' for s in probe.get('streams', []))
-        if has_audio:
-            duration = float(probe['format'].get('duration', 0))
-            cmd.insert(-3, '-i')
-            cmd.insert(-2, str(source_video))
-            cmd.insert(-5, '-shortest')
-    except Exception as e:
-        print(f"  Note: Could not detect/preserve audio: {e}")
+    except Exception:
+        pass
+
+    cmd = ['ffmpeg', '-stats', '-y',
+           '-framerate', f'{fps:.6f}',
+           '-pattern_type', 'glob',
+           '-i', pattern]
+    if has_audio:
+        cmd += ['-i', str(source_video)]
+
+    cmd += ['-map', '0:v']
+    if has_audio:
+        cmd += ['-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest']
+
+    cmd += ['-c:v', 'libx264', '-crf', '18',
+            '-pix_fmt', 'yuv420p',
+            str(output_path)]
 
     run_command(cmd, check=True)
     return output_path
+
 
 def cleanup_temp(temp_dir):
     """Remove temporary directory."""
@@ -464,6 +452,8 @@ Examples:
     parser.add_argument('--sample-region', type=str, default='corners',
                         help='Where to sample for key color detection: corners, center, full, '
                              'or custom WxH+X+Y in source pixels (default: corners)')
+    parser.add_argument('--render-font-size', type=int, default=64,
+                        help='Font rasterization quality (default: 64)')
 
     args = parser.parse_args()
 
@@ -558,7 +548,10 @@ Examples:
         rendered_images = render_ascii_to_images(
             ascii_files, frames, img_dir,
             leave_black_empty=args.leave_black_empty,
-            black_threshold=args.black_threshold
+            black_threshold=args.black_threshold,
+            input_width=width,
+            input_height=height,
+            base_font_size=args.render_font_size
         )
         if args.leave_black_empty:
             print(f"  Black areas: Left empty (threshold: {args.black_threshold})")
