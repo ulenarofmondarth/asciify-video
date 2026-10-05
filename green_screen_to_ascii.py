@@ -265,14 +265,13 @@ def load_monospace_font(font_size=12):
 
 def render_ascii_to_images(ascii_files, frame_images, img_dir,
                            leave_black_empty=False, black_threshold=50,
-                           input_width=1920, input_height=1080,
-                           base_font_size=64):
-    """Render ASCII text as images that EXACTLY match input dimensions.
+                           target_width=1920, target_height=1080,  # <- Changed to target
+                           source_width=1920, source_height=1080,  # <- Added for mask mapping
+                           font_size=24):
+    """Render ASCII text as images at TARGET resolution.
 
-    A fixed character grid (pre-scanned across all frames) is mapped onto
-    the input resolution, and each character is pre-rendered once and
-    stretched to exactly one cell. Character size is therefore identical
-    across all frames and all videos of the same resolution.
+    Character sizing is based on target, not source, ensuring consistency
+    across videos of different resolutions when processed together.
     """
     try:
         from PIL import Image, ImageDraw
@@ -281,9 +280,15 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
         sys.exit(1)
 
     img_dir.mkdir(parents=True, exist_ok=True)
-    font = load_monospace_font(base_font_size)   # larger = crisper downscale
+    font = load_monospace_font(font_size)
 
-    # --- Pre-scan: fixed grid size across ALL frames ---
+    # Font-derived integer cell metrics (native)
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent
+    bbox = font.getbbox("M")
+    char_w = (bbox[2] - bbox[0]) or 6
+
+    # Pre-scan: fixed grid size across ALL frames
     max_cols, max_rows = 0, 0
     for af in ascii_files:
         with open(af, 'r') as f:
@@ -293,15 +298,18 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
     if max_cols == 0 or max_rows == 0:
         raise ValueError("No ASCII content found in any frame")
 
-    # --- Map the grid onto the input dimensions ---
-    cell_w = input_width / max_cols
-    cell_h = input_height / max_rows
+    # GRID CANVAS = TARGET RESOLUTION (NOT source)
+    grid_w = target_width
+    grid_h = target_height
+
+    # Cell dimensions derived from TARGET (not source)
+    cell_w = grid_w / max_cols
+    cell_h = grid_h / max_rows
     glyph_w = max(1, int(round(cell_w)))
     glyph_h = max(1, int(round(cell_h)))
 
-    # --- Pre-render each distinct character once, scaled to one cell ---
+    # Cache glyphs at target-appropriate size
     glyph_cache = {}
-
     def get_glyph(ch):
         if ch not in glyph_cache:
             bbox = font.getbbox(ch)
@@ -313,7 +321,7 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
             glyph_cache[ch] = gi.resize((glyph_w, glyph_h), Image.LANCZOS)
         return glyph_cache[ch]
 
-    blank = Image.new('RGB', (input_width, input_height), 'black')
+    blank = Image.new('RGB', (grid_w, grid_h), 'black')
     rendered_images = []
 
     for i, ascii_file in enumerate(tqdm(ascii_files, desc="  Rendering images", unit="frame")):
@@ -323,13 +331,11 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
             text = f.read()
         lines = text.rstrip('\n').split('\n')
 
-        # Blank frame: emit solid black at exact input size
         if not any(l.strip() for l in lines):
             blank.save(out_path)
             rendered_images.append(out_path)
             continue
 
-        # Luminance source for --leave-black-empty
         luminance_map = {}
         pil_img = None
         if leave_black_empty and frame_images and i < len(frame_images):
@@ -340,11 +346,11 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
                 luminance_map = {(x, y): pixels[y * w + x]
                                  for y in range(h) for x in range(w)}
             except Exception as e:
-                print(f"  Warning: Could not load frame {i} for luminance check: {e}")
+                print(f"  Warning: Could not load frame {i}: {e}")
 
         num_rows = max(len(lines), 1)
 
-        img = Image.new('RGB', (input_width, input_height), 'black')
+        img = Image.new('RGB', (grid_w, grid_h), 'black')
 
         for y, line in enumerate(lines):
             for x, ch in enumerate(line):
@@ -352,6 +358,7 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
                     continue
 
                 if leave_black_empty and luminance_map and pil_img:
+                    # Map grid coords → SOURCE frame (not target!)
                     px = min(int(((x + 0.5) / max_cols) * pil_img.width),
                              pil_img.width - 1)
                     py = min(int(((y + 0.5) / num_rows) * pil_img.height),
@@ -365,7 +372,7 @@ def render_ascii_to_images(ascii_files, frame_images, img_dir,
         img.save(out_path)
         rendered_images.append(out_path)
 
-    print(f"  Grid: {max_cols}x{max_rows} chars, cell = {glyph_w}x{glyph_h}px")
+    print(f"  Grid: {max_cols}x{max_rows} chars @ {grid_w}x{grid_h} (target)")
     return rendered_images
 
 
@@ -395,6 +402,20 @@ def assemble_video(rendered_images, output_path, fps, source_video):
     cmd += ['-map', '0:v']
     if has_audio:
         cmd += ['-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest']
+
+    # Scale to target if frames aren't already at target
+    if rendered_images:
+        try:
+            probe_frame = json.loads(run_command([
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+                '-of', 'csv=p=0:s=x', str(rendered_images[0])
+            ]).stdout)
+            fw, fh = map(int, probe_frame.strip().split('x'))
+            if fw != target_width or fh != target_height:
+                cmd += ['-vf', f'scale={target_width}:{target_height}:flags=lanczos']
+        except:
+            pass
 
     cmd += ['-c:v', 'libx264', '-crf', '18',
             '-pix_fmt', 'yuv420p',
@@ -454,6 +475,10 @@ Examples:
                              'or custom WxH+X+Y in source pixels (default: corners)')
     parser.add_argument('--render-font-size', type=int, default=64,
                         help='Font rasterization quality (default: 64)')
+    parser.add_argument('--target-resolution', type=str, default=None,
+                        help='Target output resolution WIDTHxHEIGHT (e.g., 1920x1080). '
+                             'All outputs are resized to this, ensuring consistent '
+                             'character sizing across videos of different resolutions.')
 
     args = parser.parse_args()
 
@@ -545,13 +570,21 @@ Examples:
         # Stage 6: Render ASCII to images and assemble
         print("[6/6] Rendering ASCII and assembling video...")
         img_dir = temp_dir / 'images'
+        # Parse target resolution
+        if args.target_resolution:
+            tw, th = map(int, args.target_resolution.split('x'))
+        else:
+            tw, th = width, height  # Fall back to source
+
         rendered_images = render_ascii_to_images(
             ascii_files, frames, img_dir,
             leave_black_empty=args.leave_black_empty,
             black_threshold=args.black_threshold,
-            input_width=width,
-            input_height=height,
-            base_font_size=args.render_font_size
+            source_width=width,
+            source_height=height,
+            target_width=tw,
+            target_height=th,
+            font_size=args.render_font_size
         )
         if args.leave_black_empty:
             print(f"  Black areas: Left empty (threshold: {args.black_threshold})")
