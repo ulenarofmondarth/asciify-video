@@ -35,7 +35,7 @@ from tqdm import tqdm
 DEFAULT_RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
 JP2A_RAMP = " .',;:clodxkO0KXNWM"
 
-STATE_DIR = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'ascii_video'
+STATE_DIR = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'asciify'
 STATE_FILE = STATE_DIR / 'state.json'
 
 TQDM_DISABLED = False   # set from --silent-progress in main()
@@ -763,7 +763,7 @@ Examples:
               f"{', '.join(skipped)}")
 
     run_start = time.time()
-    temp_dir = Path(tempfile.mkdtemp(prefix='ascii_video_'))
+    temp_dir = Path(tempfile.mkdtemp(prefix='asciify_'))
 
     # Begin run-state recording
     state = load_state()
@@ -776,7 +776,7 @@ Examples:
 
     try:
         print("\n" + "="*60)
-        print("GREEN SCREEN TO ASCII VIDEO CONVERTER")
+        print("ASCIIFY")
         print("="*60 + "\n")
 
         # ---- Stage 1: Probe (restored from state when reusing) ----
