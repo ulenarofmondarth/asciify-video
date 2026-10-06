@@ -116,6 +116,7 @@ def report_state(state):
     if r.get('target_width'):
         print(f"Render:     {r['target_width']}x{r['target_height']}, "
               f"font={r.get('font_size')}, "
+              f"color={'source' if r.get('colorized') else 'mono'}, "
               f"black-empty={'on' if r.get('leave_black_empty') else 'off'}"
               + (f" thr={r.get('black_threshold')}"
                  if r.get('leave_black_empty') else ""))
@@ -334,35 +335,41 @@ def load_monospace_font(font_size=12):
 # --------------------- Fused parallel convert + render ---------------------
 
 def _process_one_frame(task):
-    """Worker: frame PNG -> ASCII (in memory) -> rendered PNG.
+    """Worker: frame PNG -> ASCII -> rendered PNG.
 
-    ascii_mode: 'compute' (fuse conversion from frame) or
-                'file' (read existing ascii_path, e.g. --reuse ascii)
-    Returns (out_path, ascii_text) so the parent can persist .txt files
-    for --keep-temp debugging/reuse.
+    ascii_mode: 'compute' (convert from frame) or 'file' (reuse existing .txt)
+    Returns (out_path, ascii_text).
     """
     (frame_path, out_path, ascii_mode, ascii_path, ramp, stretch, metrics,
-     leave_black_empty, black_threshold) = task
+     leave_black_empty, black_threshold, colorized) = task
 
     from PIL import Image, ImageDraw
 
     (max_cols, max_rows, cell_w, cell_h, off_x, off_y,
      target_width, target_height, base_font_size) = metrics
 
-    # --- Stage A: obtain ASCII lines ---
-    mask_img = None
+    # --- Stage A: obtain ASCII lines (+ per-cell colors if colorized) ---
+    color_grid = None
+    lum_grid = None          # small L image at grid res, for black masking
+    rows = max_rows
+
     if ascii_mode == 'file':
         with open(ascii_path, 'r') as f:
             lines = f.read().rstrip('\n').split('\n')
-        if leave_black_empty and frame_path:
-            src = Image.open(frame_path).convert('L')
-            mask_img = src.resize((max_cols, max_rows), Image.LANCZOS)
+        # Reference frame still supplies color / black-mask data
+        src_rgb = Image.open(frame_path).convert('RGB')
+        rgb_small = src_rgb.resize((max_cols, max_rows), Image.BOX)
+        if colorized:
+            color_grid = list(rgb_small.getdata())
+        if leave_black_empty:
+            lum_grid = rgb_small.convert('L')
     else:
-        img = Image.open(frame_path).convert('L')
-        w, h = img.size
-        rows = max(1, h // 2)
-        img = img.resize((max_cols, rows), Image.LANCZOS)
-        pixels = list(img.getdata())
+        # Resize in RGB first, then take luminance: averaging happens in
+        # color space, which weights channels correctly (unlike L-then-resize)
+        src_rgb = Image.open(frame_path).convert('RGB')
+        rgb_small = src_rgb.resize((max_cols, rows), Image.BOX)
+        lum = rgb_small.convert('L')
+        pixels = list(lum.getdata())
 
         if stretch is not None:
             lo, hi = stretch
@@ -375,8 +382,11 @@ def _process_one_frame(task):
             row = pixels[y * max_cols:(y + 1) * max_cols]
             lines.append(''.join(
                 ramp[min(len(ramp) - 1, int(p * scale))] for p in row))
+
+        if colorized:
+            color_grid = list(rgb_small.getdata())
         if leave_black_empty:
-            mask_img = img
+            lum_grid = lum
 
     ascii_text = '\n'.join(lines)
 
@@ -387,48 +397,76 @@ def _process_one_frame(task):
         return out_path, ascii_text
 
     lines = [l.ljust(max_cols)[:max_cols] for l in lines]
+    if len(lines) > max_rows:
+        lines = lines[:max_rows]
 
     font = load_monospace_font(base_font_size)
-    glyph_cache = {}
+    glyph_cache = {}   # char -> L-mode alpha mask at cell size
 
     def get_glyph(ch):
         if ch not in glyph_cache:
             b = font.getbbox(ch)
-            gw = max(1, b[2] - b[0])
-            gh = max(1, b[3] - b[1])
-            gi = Image.new('RGBA', (gw, gh), (0, 0, 0, 0))
+            gw, gh = max(1, b[2] - b[0]), max(1, b[3] - b[1])
+            gi = Image.new('L', (gw, gh), 0)
             ImageDraw.Draw(gi).text((-b[0], -b[1]), ch,
-                                    font=font, fill=(100, 255, 100))
+                                    font=font, fill=255)
             glyph_cache[ch] = gi.resize((cell_w, cell_h), Image.LANCZOS)
         return glyph_cache[ch]
 
-    mask_pixels = list(mask_img.getdata()) if mask_img else []
-    mw = mask_img.width if mask_img else 0
+    grid_w, grid_h = cell_w * max_cols, cell_h * max_rows
 
-    img = blank.copy()
-    for y, line in enumerate(lines):
-        if y >= max_rows:
-            break
-        for x, ch in enumerate(line):
-            if ch == ' ':
-                continue
-            if leave_black_empty and mask_pixels:
-                px = min(int(((x + 0.5) / max_cols) * mask_img.width),
-                         mask_img.width - 1)
-                py = min(int(((y + 0.5) / max_rows) * mask_img.height),
-                         mask_img.height - 1)
-                if mask_pixels[py * mw + px] < black_threshold:
+    if colorized:
+        # --- Composite path: coverage mask + color layer, one paste ---
+        coverage = Image.new('L', (grid_w, grid_h), 0)
+        cell_colors = [(0, 0, 0)] * (max_cols * max_rows)
+
+        for y, line in enumerate(lines):
+            for x, ch in enumerate(line):
+                if ch == ' ':
                     continue
-            glyph = get_glyph(ch)
-            img.paste(glyph, (off_x + x * cell_w, off_y + y * cell_h), glyph)
+                idx = y * max_cols + x
+                if leave_black_empty and lum_grid is not None:
+                    if lum_grid.getpixel((x, y)) < black_threshold:
+                        continue
+                if color_grid is not None:
+                    cell_colors[idx] = color_grid[idx]
+                coverage.paste(get_glyph(ch), (x * cell_w, y * cell_h))
+
+        color_layer = Image.new('RGB', (max_cols, max_rows), 'black')
+        color_layer.putdata(cell_colors)
+        color_layer = color_layer.resize((grid_w, grid_h), Image.NEAREST)
+
+        img = blank.copy()
+        img.paste(color_layer, (off_x, off_y), coverage)
+    else:
+        # --- Monochrome path (unchanged fast single-color glyphs) ---
+        img = blank.copy()
+        glyph_rgba = {}
+        for y, line in enumerate(lines):
+            for x, ch in enumerate(line):
+                if ch == ' ':
+                    continue
+                if leave_black_empty and lum_grid is not None:
+                    if lum_grid.getpixel((x, y)) < black_threshold:
+                        continue
+                if ch not in glyph_rgba:
+                    m = get_glyph(ch)
+                    rgba = Image.new('RGBA', m.size, (0, 0, 0, 0))
+                    rgba.putalpha(m)
+                    solid = Image.new('RGBA', m.size, (100, 255, 100, 255))
+                    rgba.paste(solid, (0, 0), m)
+                    glyph_rgba[ch] = rgba
+                img.paste(glyph_rgba[ch],
+                          (off_x + x * cell_w, off_y + y * cell_h),
+                          glyph_rgba[ch])
 
     img.save(out_path)
     return out_path, ascii_text
 
-
 def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
                               leave_black_empty=False, black_threshold=50,
-                              jobs=None, ascii_files=None, txt_dir=None):
+                              jobs=None, ascii_files=None, txt_dir=None,
+                              colorized=False):
     """Fused parallel convert+render.
 
     ascii_files: None to convert from frames (fused); or a list of .txt
@@ -448,7 +486,7 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
             ascii_mode, ascii_path = 'compute', None
         tasks.append((str(frame), str(out_path), ascii_mode, ascii_path,
                       ramp, stretch, metrics, leave_black_empty,
-                      black_threshold))
+                      black_threshold, colorized))
 
     rendered_images = []
     texts = [None] * len(tasks)
@@ -580,7 +618,8 @@ Examples:
                         help="'jp2a' or a custom ramp string "
                              "(default: full density ramp)")
     parser.add_argument('--colorized', action='store_true',
-                        help='(reserved) colored ASCII output')
+                        help='Render characters in their source colors '
+                             'instead of monochrome green')
     parser.add_argument('--leave-black-empty', action='store_true',
                         help='Leave black areas empty (no ASCII characters)')
     parser.add_argument('--black-threshold', type=int, default=50,
@@ -855,7 +894,8 @@ Examples:
                     frames, img_dir, metrics, ramp, None,
                     leave_black_empty=args.leave_black_empty,
                     black_threshold=args.black_threshold,
-                    jobs=args.jobs, ascii_files=ascii_files)
+                    jobs=args.jobs, ascii_files=ascii_files,
+                    colorized=args.colorized)
             else:
                 # Fresh (or reuse 'extracted'): grid is analytic
                 from PIL import Image
@@ -874,7 +914,8 @@ Examples:
                     leave_black_empty=args.leave_black_empty,
                     black_threshold=args.black_threshold,
                     jobs=args.jobs,
-                    txt_dir=(temp_dir / 'txt_frames') if args.keep_temp else None)
+                    txt_dir=(temp_dir / 'txt_frames') if args.keep_temp else None,
+                    colorized=args.colorized)
 
         state['grid'] = {
             'ascii_width': max_cols, 'rows': max_rows,
@@ -885,6 +926,7 @@ Examples:
         state['render'] = {
             'target_width': tw, 'target_height': th,
             'font_size': args.render_font_size,
+            'colorized': args.colorized,
             'leave_black_empty': args.leave_black_empty,
             'black_threshold': args.black_threshold,
         }
