@@ -15,6 +15,7 @@ Convert green-screen video to ASCII art video with consistent output geometry, m
 - **Performance is optimized** via ProcessPoolExecutor parallelization
 - **Iteration is fast** via artifact reuse (`--reuse extracted|ascii|final`)
 - **Backgrounds are flexible** — any color, fully transparent, or anywhere in between
+- **Font colors are customizable** — choose any CSS hex color for characters
 - **Everything is documented** via JSON state files and `--report`
 
 ## Features
@@ -25,8 +26,10 @@ Convert green-screen video to ASCII art video with consistent output geometry, m
 | **Manual key override** | Specify exact hex color with `--key-color` |
 | **Chromakey-to-background** | Composites keyed subject over a selectable background |
 | **Background color & alpha** | Any CSS hex color; opacity 0-1, including full transparency (`--background-color`, `--background-alpha`) |
+| **Font color selection** | Choose any CSS hex color for characters (`--font-color`, default: `#64FF64`) |
 | **Automatic WebM selection** | Alpha output automatically targets `.webm`, renaming the output file with a prominent notice |
 | **VP9 speed control** | Tune alpha encode speed with `--vpx-preset` |
+| **Mutual exclusivity enforcement** | `--font-color` and `--colorized` cannot both be specified (clear error + abort) |
 | **Direct luminance mapping** | Custom Python rasterizer (no external `jp2a` dependency) |
 | **Parallel processing** | Multi-core conversion and rendering via `ProcessPoolExecutor` |
 | **Histogram stretching** | Global luminance remapping (`--hist-stretch`) prevents per-frame brightness pumping |
@@ -90,7 +93,7 @@ This will:
 2. Chromakey subject onto black background
 3. Extract frames scaled to 160 characters wide
 4. Convert each frame to ASCII (160 cols x calculated rows)
-5. Render ASCII at source resolution
+5. Render ASCII with green (#64FF64) characters
 6. Assemble final video
 
 ### With manual key color
@@ -177,6 +180,38 @@ Alpha encoding with VP9 can be slow. Control the speed/quality trade-off:
 
 Presets map to VP9 `cpu-used` values from 8 (ultrafast) down to 0 (slow).
 
+## Font Color Selection
+
+Characters render in a uniform color (default: `#64FF64`, the classic terminal green):
+
+```bash
+# Classic green (default, unchanged output)
+./asciify.py in.mp4 out.mp4
+
+# Amber terminal look
+./asciify.py in.mp4 out.mp4 --font-color '#FFB000'
+
+# Cyan on dark gray
+./asciify.py in.mp4 out.mp4 --font-color '#00FFFF' \
+    --background-color '#101820' --background-alpha 1
+
+# White text
+./asciify.py in.mp4 out.mp4 --font-color '#FFFFFF' --background-color '#000000' --background-alpha 1
+```
+
+### Incompatibility with colorized mode
+
+`--font-color` and `--colorized` are mutually exclusive. The script detects this conflict upfront and aborts immediately with a clear error message:
+
+```
+$ ./asciify.py in.mp4 out.mp4 --font-color '#FF0000' --colorized
+Error: --font-color and --colorized are mutually exclusive.
+       --colorized samples each character's color from the source frame,
+       leaving no role for a uniform --font-color.
+```
+
+This hard error prevents wasting time on a full render that would violate the intended behavior.
+
 ## Advanced Usage
 
 ### Artifact reuse (iteration workflow)
@@ -199,7 +234,7 @@ The `--keep-temp` flag preserves intermediate artifacts for rapid iteration:
 | Level | Skips stages | Reuses from disk | Typical iteration |
 |-------|--------------|------------------|-------------------|
 | `extracted` | keying, chromakey, extraction | frames/*.png | Fix key color and retry |
-| `ascii` | + conversion | txt_frames/*.txt, frames/*.png | Tweak rendering (font, colors, masking, background) |
+| `ascii` | + conversion | txt_frames/*.txt, frames/*.png | Tweak rendering (font color, backgrounds, masking) |
 | `final` | + rendering | images/rendered_*.png | Tune encoder (FPS, resolution, audio) |
 
 #### What still works at each level
@@ -212,19 +247,19 @@ $ ./asciify.py input.mp4 out.mp4 --reuse final --background-alpha 0.5
   Level: final  (frames=108, ascii=108, rendered=108)
   Stages skipped: keying, conversion, rendering
   No effect at this level: --ascii-width, --background-alpha, --background-color,
-    --black-threshold, --colorized, --detect-green, --edge-blending,
+    --black-threshold, --colorized, --font-color, --detect-green, --edge-blending,
     --hist-stretch, --jobs, --key-color, --leave-black-empty, --no-key,
     --ramp, --render-font-size, --sample-region, --scale-divisor, --tolerance
-    !! --background-alpha was passed but is IGNORED (--reuse final)
+    !! --font-color was passed but is IGNORED (--reuse final)
   Still honored: --fps, --target-resolution (frames rescaled at assembly), audio mapping
   Note: background color/alpha, font, and masking are baked into the reused frames
 ```
 
 Summary:
 
-- **`extracted`**: conversion and rendering options all work (`--ascii-width`, `--ramp`, `--hist-stretch`, fonts, backgrounds)
-- **`ascii`**: rendering options still work — including `--background-color`, `--background-alpha`, `--colorized`, and `--leave-black-empty` — since rendering re-runs from the reused text. The character grid comes from the stored text files, so `--ascii-width` is advisory only.
-- **`final`**: background, font, and masking options are baked into the reused frames and have no effect. `--fps`, `--target-resolution` (assembly rescales frames), and audio mapping are still honored.
+- **`extracted`**: conversion and rendering options all work (`--ascii-width`, `--ramp`, `--hist-stretch`, fonts, backgrounds, font color)
+- **`ascii`**: rendering options still work — including `--font-color`, `--background-color`, `--background-alpha`, `--colorized`, and `--leave-black-empty` — since rendering re-runs from the reused text. The character grid comes from the stored text files, so `--ascii-width` is advisory only.
+- **`final`**: background color/alpha, font color, font size, and masking options are baked into the reused frames and have no effect. `--fps`, `--target-resolution` (assembly rescales frames), and audio mapping are still honored.
 
 ### State inspection
 
@@ -250,10 +285,10 @@ Stages:     probe, key, extract, ascii, render, assemble
 Source:     1920x1080 @ 24.00 fps, audio=yes
 Keying:     0x00B140 (auto-detected), tol=0.25, blend=0.05
 Grid:       160 cols x 135 rows, stretch=off, ramp='default'
-Render:     1920x1080, font=64, color=mono, black-empty=off
-Background: #000000, alpha=0.00  (transparent WebM)
+Render:     1920x1080, font=64, color=#FFB000, black-empty=off
+Background: #000000, alpha=1.00
 Artifacts:  frames=108, ascii=108, rendered=108
-Last output: output.webm
+Last output: output.mp4
 ```
 
 ### Environment override for reuse directory
@@ -297,10 +332,11 @@ export ASCII_VIDEO_TEMP=/path/to/previous/temp
 | `--ascii-width` | 160 | ASCII grid width in characters |
 | `--ramp` | default | `'jp2a'` or custom ramp string |
 | `--colorized` | off | Render characters in source colors |
+| `--font-color` | `#64FF64` | Character color, CSS hex (incompatible with `--colorized`) |
 | `--leave-black-empty` | off | Leave dark areas as true emptiness |
 | `--black-threshold` | 50 | Brightness threshold for "black" (0-255) |
 | `--background-color` | `#000000` | Background color, CSS hex (`#RRGGBB`) |
-| `--background-alpha` | 1 | Background opacity 0-1 (below 1 selects WebM) |
+| `--background-alpha` | 0 | Background opacity 0-1 (below 1 selects WebM) |
 | `--vpx-preset` | `ultrafast` | VP9 encode speed for alpha: `ultrafast`, `veryfast`, `faster`, `fast`, `medium`, `slow` |
 | `--hist-stretch` | off | Global histogram stretch before mapping |
 | `--sample-region` | `corners` | Sampling region: `corners`, `center`, `full`, or `WxH+X+Y` |
@@ -350,7 +386,12 @@ This guarantees **identical character dimensions** across all videos rendered wi
 
 ### Alpha-aware rendering and assembly
 
-Rendered frames are RGBA images: the background layer carries the user-selected color at the user-selected alpha, while all glyphs remain fully opaque. During assembly:
+Rendered frames are RGBA images: the background layer carries the user-selected color at the user-selected alpha, while all glyphs remain fully opaque in either:
+
+- The uniform `--font-color` tint (monochrome mode), or
+- Per-cell colors sampled from the source (colorized mode)
+
+During assembly:
 
 - **Opaque output** (`--background-alpha 1`): H.264/MP4 with AAC audio.
 - **Alpha output** (below 1): PNGs are fed to ffmpeg with the input pixel format forced to RGBA (preventing a format-negotiation hang in some builds), encoded as VP9 `yuva420p` WebM with a configurable `cpu-used` speed, realtime deadline, and row-based multithreading enabled. Audio is re-encoded as Opus, falling back to Vorbis if the build lacks `libopus`.
@@ -391,18 +432,19 @@ Stored at `~/.cache/asciify/state.json`:
     "target_width": 1920,
     "target_height": 1080,
     "font_size": 64,
+    "font_color": "#FFB000",
     "colorized": false,
     "leave_black_empty": false,
     "black_threshold": 50,
     "bg_color": "#000000",
-    "bg_alpha": 0.0
+    "bg_alpha": 1.0
   },
   "counts": {
     "frames": 108,
     "ascii_files": 108,
     "rendered_images": 108
   },
-  "output": "/path/to/output.webm",
+  "output": "/path/to/output.mp4",
   "duration_s": 127.4
 }
 ```
@@ -434,6 +476,10 @@ The reuse validation checks that all required artifact directories exist and con
 3. Artifacts were manually deleted
 
 Solution: re-run with `--keep-temp` from scratch, or specify a different `--reuse-dir`.
+
+### `--font-color` and `--colorized` both specified
+
+These options are mutually exclusive — `--colorized` samples each cell's color from the source frame, so a uniform `--font-color` has nothing to control. The script detects this conflict at startup and aborts with a clear explanation. Choose one or the other.
 
 ### Alpha encoding hangs or fails
 
@@ -521,6 +567,8 @@ chmod +x asciify.py       # Make executable (Linux/macOS)
 - [ ] `--no-key` mode on pre-keyed footage
 - [ ] `--hist-stretch` preventing brightness pumping
 - [ ] `--colorized` mode producing correct per-cell colors
+- [ ] `--font-color` changing character color correctly
+- [ ] `--font-color` + `--colorized` conflict detected and aborted with clear error
 - [ ] `--target-resolution` consistency across inputs
 - [ ] Background colors rendering correctly (opaque)
 - [ ] Alpha transparency surviving to final WebM (`yuva420p` verified via ffprobe)
@@ -529,8 +577,9 @@ chmod +x asciify.py       # Make executable (Linux/macOS)
 - [ ] Audio preserved in alpha mode (Opus, Vorbis fallback)
 - [ ] VP9 speed presets varying encode time as expected
 - [ ] `--reuse` levels validating, skipping, and reporting ignored flags correctly
+- [ ] `STAGE_FLAG_MAP` correctly registering all rendering flags including `--font-color`
 - [ ] `--keep-temp` creating and recording state
-- [ ] `--report` displaying accurate last-run info including background fields
+- [ ] `--report` displaying accurate last-run info including font color and background fields
 - [ ] Blank frame handling (empty subjects, including transparent blanks)
 - [ ] Cross-platform font fallback
 

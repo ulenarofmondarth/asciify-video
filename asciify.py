@@ -42,6 +42,32 @@ TQDM_DISABLED = False   # set from --silent-progress in main()
 
 STAGES = ['probe', 'key', 'extract', 'ascii', 'render', 'assemble']
 
+# ============================================================================
+# Reuse Semantics Mapping
+# Maps CLI options to their pipeline stage for reuse-aware messaging
+# ============================================================================
+
+STAGE_FLAG_MAP = {
+    'keying': [
+        '--key-color', '--detect-green', '--tolerance',
+        '--edge-blending', '--sample-region', '--no-key'
+    ],
+    'conversion': [
+        '--ramp', '--hist-stretch', '--ascii-width', '--scale-divisor'
+    ],
+    'rendering': [
+        '--render-font-size', '--colorized', '--font-color',
+        '--leave-black-empty', '--black-threshold',
+        '--background-color', '--background-alpha', '--jobs'
+    ],
+}
+
+REUSE_SKIPPED_STAGES = {
+    'extracted': ['keying'],
+    'ascii':     ['keying', 'conversion'],
+    'final':     ['keying', 'conversion', 'rendering'],
+}
+
 # ------------------------------ Run state ----------------------------------
 
 def load_state():
@@ -114,9 +140,12 @@ def report_state(state):
 
     r = state.get('render') or {}
     if r.get('target_width'):
+        if r.get('colorized'):
+            color_note = 'source'
+        else:
+            color_note = r.get('font_color', '#64FF64')
         print(f"Render:     {r['target_width']}x{r['target_height']}, "
-              f"font={r.get('font_size')}, "
-              f"color={'source' if r.get('colorized') else 'mono'}, "
+              f"font={r.get('font_size')}, color={color_note}, "
               f"black-empty={'on' if r.get('leave_black_empty') else 'off'}"
               + (f" thr={r.get('black_threshold')}"
                  if r.get('leave_black_empty') else ""))
@@ -352,7 +381,7 @@ def _process_one_frame(task):
     """
     (frame_path, out_path, ascii_mode, ascii_path, ramp, stretch, metrics,
      leave_black_empty, black_threshold, colorized,
-     bg_color_rgb, bg_alpha) = task
+     bg_color_rgb, bg_alpha, font_color_rgb) = task
 
     from PIL import Image, ImageDraw
 
@@ -466,7 +495,7 @@ def _process_one_frame(task):
                     m = get_glyph(ch)
                     rgba = Image.new('RGBA', m.size, (0, 0, 0, 0))
                     rgba.putalpha(m)
-                    solid = Image.new('RGBA', m.size, (100, 255, 100, 255))
+                    solid = Image.new('RGBA', m.size, (*font_color_rgb, 255))
                     rgba.paste(solid, (0, 0), m)
                     glyph_rgba[ch] = rgba
                 img.paste(glyph_rgba[ch],
@@ -480,7 +509,7 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
                               leave_black_empty=False, black_threshold=50,
                               jobs=None, ascii_files=None, txt_dir=None,
                               colorized=False, bg_color_rgb=(0, 0, 0),
-                              bg_alpha=0.0):
+                              bg_alpha=0.0, font_color_rgb=(100, 255, 100)):
     """Fused parallel convert+render.
 
     ascii_files: None to convert from frames (fused); or a list of .txt
@@ -500,7 +529,7 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
             ascii_mode, ascii_path = 'compute', None
         tasks.append((str(frame), str(out_path), ascii_mode, ascii_path,
                       ramp, stretch, metrics, leave_black_empty,
-                      black_threshold, colorized, bg_color_rgb, bg_alpha))
+                      black_threshold, colorized, bg_color_rgb, bg_alpha, font_color_rgb))
 
     rendered_images = []
     texts = [None] * len(tasks)
@@ -697,6 +726,39 @@ def frame_num(p):
     digits = ''.join(ch for ch in stem if ch.isdigit())
     return int(digits) if digits else 0
 
+def report_reuse_semantics(reuse_level):
+    """Explain which options are dead and which still work at this reuse level,
+    highlighting anything the user actually passed."""
+    skipped = REUSE_SKIPPED_STAGES[reuse_level]
+    ignored = sorted({f for s in skipped for f in STAGE_FLAG_MAP.get(s, [])})
+
+    print(f"  Stages skipped: {', '.join(skipped)}")
+    if ignored:
+        print(f"  No effect at this level: {', '.join(ignored)}")
+
+    # Did the user actually pass any of the dead flags?
+    passed = []
+    for arg in sys.argv[1:]:
+        flag_name = arg.split('=')[0]
+        if flag_name in ignored:
+            passed.append(flag_name)
+
+    for f in sorted(set(passed)):
+        print(f"    !! {f} was passed but is IGNORED (--reuse {reuse_level})")
+
+    if reuse_level == 'final':
+        print("  Still honored: --fps, --target-resolution "
+              "(frames rescaled at assembly), audio mapping")
+        print("  Note: background color/alpha, font, and masking are "
+              "baked into the reused frames")
+    elif reuse_level == 'ascii':
+        print("  Still honored: font, colorized, black-masking, and "
+              "background options (rendering re-runs from reused text)")
+        print("  Note: character grid comes from the reused text files")
+    else:  # extracted
+        print("  Still honored: conversion and rendering options "
+              "(--ascii-width, --ramp, --hist-stretch, fonts, backgrounds)")
+
 # --------------------------------- Main --------------------------------------
 
 def cleanup_temp(temp_dir):
@@ -713,7 +775,7 @@ Examples:
   %(prog)s input.mp4 out.mp4 --key-color 0x00FF00 --ascii-width 480
   %(prog)s input.mp4 out.mp4 --no-key --leave-black-empty
   %(prog)s input.mp4 out.mp4 --keep-temp
-  %(prog)s --report
+  %(prog)s -i
   %(prog)s input.mp4 out2.mp4 --reuse ascii --render-font-size 96
   %(prog)s input.mp4 out3.mp4 --reuse final
         """
@@ -785,6 +847,10 @@ Examples:
     parser.add_argument('--vpx-preset', type=str, default='ultrafast',
                         choices=['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
                         help='VP9 encoding speed for alpha output (default: ultrafast)')
+    parser.add_argument('--font-color', type=str, default='#64FF64',
+                        help='Character color in CSS hex format '
+                             '(default: #64FF64, the classic terminal green). '
+                             'Incompatible with --colorized')
 
     args = parser.parse_args()
 
@@ -851,6 +917,25 @@ Examples:
                 print(f"!  writing to {alt} instead\n")
                 output_path = alt
 
+    if args.font_color and args.colorized:
+        print("Error: --font-color and --colorized are mutually exclusive.")
+        print("       --colorized samples each character's color from the "
+                              "source frame,")
+        print("       leaving no role for a uniform --font-color.")
+        sys.exit(1)
+
+    fc_hex = args.font_color.lstrip('#')
+    try:
+        font_color_rgb = (
+            int(fc_hex[0:2], 16),
+            int(fc_hex[2:4], 16),
+            int(fc_hex[4:6], 16),
+        )
+    except (ValueError, IndexError):
+        print(f"Error: Invalid font color '{args.font_color}'. "
+              f"Use CSS hex format (e.g., #64FF64)")
+        sys.exit(1)
+
     # ---- Resolve reuse ----
     state = load_state()
     reuse_level = args.reuse
@@ -868,13 +953,7 @@ Examples:
         print(f"  Reusing artifacts from: {reuse_dir}")
         print(f"  Level: {reuse_level}  (frames={count_dir(frames_dir)}, "
               f"ascii={count_dir(txt_dir_r)}, rendered={count_dir(img_dir_r)})")
-        skipped = {'extracted': ['keying', 'chromakey', 'extraction'],
-                   'ascii':     ['keying', 'chromakey', 'extraction',
-                                 'conversion'],
-                   'final':     ['keying', 'chromakey', 'extraction',
-                                 'conversion', 'rendering']}[reuse_level]
-        print(f"  Skipped stages (their CLI options are IGNORED): "
-              f"{', '.join(skipped)}")
+        report_reuse_semantics(reuse_level)
 
     run_start = time.time()
     temp_dir = Path(tempfile.mkdtemp(prefix='asciify_'))
@@ -1066,7 +1145,7 @@ Examples:
                     jobs=args.jobs, ascii_files=ascii_files,
                     colorized=args.colorized,
                     bg_color_rgb=bg_color_rgb,
-                    bg_alpha=bg_alpha)
+                    bg_alpha=bg_alpha, font_color_rgb=font_color_rgb)
             else:
                 # Fresh (or reuse 'extracted'): grid is analytic
                 from PIL import Image
@@ -1088,7 +1167,7 @@ Examples:
                     txt_dir=(temp_dir / 'txt_frames') if args.keep_temp else None,
                     colorized=args.colorized,
                     bg_color_rgb=bg_color_rgb,
-                    bg_alpha=bg_alpha)
+                    bg_alpha=bg_alpha, font_color_rgb=font_color_rgb)
 
         state['grid'] = {
             'ascii_width': max_cols, 'rows': max_rows,
@@ -1099,6 +1178,7 @@ Examples:
         state['render'] = {
             'target_width': tw, 'target_height': th,
             'font_size': args.render_font_size,
+            'font_color': args.font_color,
             'colorized': args.colorized,
             'leave_black_empty': args.leave_black_empty,
             'black_threshold': args.black_threshold,
