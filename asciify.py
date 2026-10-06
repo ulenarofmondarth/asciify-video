@@ -121,6 +121,13 @@ def report_state(state):
               + (f" thr={r.get('black_threshold')}"
                  if r.get('leave_black_empty') else ""))
 
+        bg = r.get('bg_color')
+        if bg:
+            alpha = r.get('bg_alpha')
+            print(f"Background: {bg}, alpha={alpha:.2f}"
+                  + ("  (transparent WebM)" if alpha is not None and alpha < 1.0
+                     else ""))
+
     c = state.get('counts') or {}
     if any(v is not None for v in c.values()):
         print(f"Artifacts:  frames={c.get('frames')}, "
@@ -335,13 +342,17 @@ def load_monospace_font(font_size=12):
 # --------------------- Fused parallel convert + render ---------------------
 
 def _process_one_frame(task):
-    """Worker: frame PNG -> ASCII -> rendered PNG.
+    """Worker: frame PNG -> ASCII (in memory) -> rendered PNG.
 
     ascii_mode: 'compute' (convert from frame) or 'file' (reuse existing .txt)
+    colorized: if True, sample character colors from source frames
+    bg_color_rgb: tuple (r, g, b) for background color
+    bg_alpha: float 0-1 for background opacity
     Returns (out_path, ascii_text).
     """
     (frame_path, out_path, ascii_mode, ascii_path, ramp, stretch, metrics,
-     leave_black_empty, black_threshold, colorized) = task
+     leave_black_empty, black_threshold, colorized,
+     bg_color_rgb, bg_alpha) = task
 
     from PIL import Image, ImageDraw
 
@@ -391,7 +402,9 @@ def _process_one_frame(task):
     ascii_text = '\n'.join(lines)
 
     # --- Stage B: render ---
-    blank = Image.new('RGB', (target_width, target_height), 'black')
+    # Transparent RGBA canvas instead of solid black RGB
+    bg_color_with_alpha = (*bg_color_rgb, int(bg_alpha * 255))
+    blank = Image.new('RGBA', (target_width, target_height), bg_color_with_alpha)
     if not any(l.strip() for l in lines):
         blank.save(out_path)
         return out_path, ascii_text
@@ -466,7 +479,8 @@ def _process_one_frame(task):
 def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
                               leave_black_empty=False, black_threshold=50,
                               jobs=None, ascii_files=None, txt_dir=None,
-                              colorized=False):
+                              colorized=False, bg_color_rgb=(0, 0, 0),
+                              bg_alpha=0.0):
     """Fused parallel convert+render.
 
     ascii_files: None to convert from frames (fused); or a list of .txt
@@ -486,7 +500,7 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
             ascii_mode, ascii_path = 'compute', None
         tasks.append((str(frame), str(out_path), ascii_mode, ascii_path,
                       ramp, stretch, metrics, leave_black_empty,
-                      black_threshold, colorized))
+                      black_threshold, colorized, bg_color_rgb, bg_alpha))
 
     rendered_images = []
     texts = [None] * len(tasks)
@@ -514,25 +528,51 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
     return rendered_images
 
 # ------------------------------- Assembly ----------------------------------
-
 def assemble_video(rendered_images, output_path, fps, source_video,
-                   has_audio, target_width, target_height, check_frames=True):
-    """Assemble rendered frames into the final video.
-
-    check_frames: if True, verify first frame matches target size (for --reuse)
-                  and adds scale filter only on mismatch.
-    """
+                   has_audio, target_width, target_height,
+                   check_frames=True, bg_alpha=0.0, vpx_preset='ultrafast'):
+    """Assemble rendered frames into the final video."""
     print("  Assembling video...")
     pattern = str(Path(rendered_images[0]).parent / 'rendered_*.png')
 
-    cmd = ['ffmpeg', '-stats', '-y',
-           '-framerate', f'{fps:.6f}',
-           '-pattern_type', 'glob',
-           '-i', pattern]
-    if has_audio and source_video is not None and Path(source_video).exists():
-        cmd += ['-i', str(source_video)]
+    use_alpha = bg_alpha < 1.0
 
-    # Optional: verify and possibly scale
+    cmd = ['ffmpeg', '-stats', '-y']
+
+    # --- Critical: Force pixel format at INPUT for alpha mode ---
+    if use_alpha:
+        print(f"  Output: WebM (VP9 + alpha)")
+        print(f"  Note: Using -pix_fmt at input to prevent encoder hang")
+        cmd += ['-pix_fmt', 'rgba',  # Force PNG decoder to output RGBA
+                '-framerate', f'{fps:.6f}',
+                '-pattern_type', 'glob',
+                '-i', pattern]
+
+        # Check Opus availability
+        try:
+            check = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True, timeout=5)
+            has_opus = 'libopus' in check.stdout
+        except:
+            has_opus = False
+
+        if has_audio and source_video and Path(source_video).exists():
+            cmd += ['-i', str(source_video)]
+            if has_opus:
+                cmd += ['-map', '1:a', '-c:a', 'libopus', '-b:a', '128k']
+            else:
+                print("  Warning: libopus unavailable, using Vorbis for audio")
+                cmd += ['-map', '1:a', '-c:a', 'libvorbis', '-b:a', '128k']
+            cmd += ['-shortest']
+    else:
+        print(f"  Output: MP4 (H.264)")
+        cmd += ['-framerate', f'{fps:.6f}',
+                '-pattern_type', 'glob',
+                '-i', pattern]
+
+        if has_audio and source_video and Path(source_video).exists():
+            cmd += ['-i', str(source_video)]
+
+    # --- Optional scaling ---
     if check_frames and rendered_images and Path(rendered_images[0]).exists():
         from PIL import Image
         try:
@@ -541,7 +581,7 @@ def assemble_video(rendered_images, output_path, fps, source_video,
             frame.close()
 
             if fw != target_width or fh != target_height:
-                print(f"  Scaling: {fw}x{fh} → {target_width}x{target_height}")
+                print(f"  Scaling: {fw}x{fh} -> {target_width}x{target_height}")
                 cmd += ['-vf',
                         f'scale={target_width}:{target_height}:flags=lanczos']
             else:
@@ -551,18 +591,47 @@ def assemble_video(rendered_images, output_path, fps, source_video,
             cmd += ['-vf',
                     f'scale={target_width}:{target_height}:flags=lanczos']
     elif check_frames:
-        # No frames to probe — assume scale needed
         cmd += ['-vf',
                 f'scale={target_width}:{target_height}:flags=lanczos']
 
+    # --- Video codec ---
     cmd += ['-map', '0:v']
-    if has_audio and source_video is not None and Path(source_video).exists():
-        cmd += ['-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest']
 
-    cmd += ['-c:v', 'libx264', '-crf', '18',
-            '-pix_fmt', 'yuv420p', str(output_path)]
+    if use_alpha:
+        # VP9 with alpha - simplified parameters that don't hang
+        speed_val = {'ultrafast': 8, 'veryfast': 6, 'faster': 4,
+                     'fast': 2, 'medium': 1, 'slow': 0}.get(vpx_preset, 4)
+        print(f"  VP9 preset: {vpx_preset} (cpu-used={speed_val})")
+        cmd += ['-c:v', 'libvpx-vp9',
+                '-crf', '20',
+                '-b:v', '0',
+                '-cpu-used', str(speed_val),
+                '-pix_fmt', 'yuva420p',  # Now safe to set at encoder
+                '-deadline', 'realtime',
+                '-realtime', 'true']
+    else:
+        if has_audio and source_video and Path(source_video).exists():
+            cmd += ['-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest']
+        cmd += ['-c:v', 'libx264', '-crf', '18',
+                '-preset', 'medium', '-pix_fmt', 'yuv420p']
+
+    cmd += [str(output_path)]
+
+    print(f"  Executing ffmpeg...")
     run_command(cmd, check=True)
     return output_path
+
+def vpx_speed_to_int(preset):
+    """Map named presets to cpu-used values."""
+    mapping = {
+        'ultrafast': 8,
+        'veryfast': 6,
+        'faster': 4,
+        'fast': 2,
+        'medium': 1,
+        'slow': 0,
+    }
+    return mapping.get(preset, 4)
 
 # ----------------------------- Reuse helpers --------------------------------
 
@@ -709,6 +778,13 @@ Examples:
                         help='Print recorded state of the last run and exit')
     parser.add_argument('--state-file', action='store_true',
                         help='Print the raw state JSON and exit')
+    parser.add_argument('--background-color', type=str, default='#000000',
+                        help='Background color in CSS hex format (default: black)')
+    parser.add_argument('--background-alpha', type=float, default=1,
+                        help='Background opacity 0-1 (0=transparent, 1=opaque; default: 1)')
+    parser.add_argument('--vpx-preset', type=str, default='ultrafast',
+                        choices=['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
+                        help='VP9 encoding speed for alpha output (default: ultrafast)')
 
     args = parser.parse_args()
 
@@ -736,6 +812,44 @@ Examples:
 
     global TQDM_DISABLED
     TQDM_DISABLED = args.silent_progress
+
+    # Parse background color
+    bg_color_hex = args.background_color.lstrip('#')
+    try:
+        bg_color_rgb = (
+            int(bg_color_hex[0:2], 16),
+            int(bg_color_hex[2:4], 16),
+            int(bg_color_hex[4:6], 16)
+        )
+    except (ValueError, IndexError):
+        print(f"Error: Invalid background color '{args.background_color}'. "
+              f"Use CSS hex format (e.g., #RRGGBB)")
+        sys.exit(1)
+
+    bg_alpha = max(0.0, min(1.0, args.background_alpha))
+
+        # Resolve output container: alpha requires WebM
+    if bg_alpha < 1.0:
+        if output_path.suffix.lower() != '.webm':
+            original_name = str(output_path)
+            output_path = output_path.with_suffix('.webm')
+            print("! " + "-"*58 + " !")
+            print(f"! {'NOTE: alpha output requires WebM'.center(56)} !")
+            print("! " + "-"*58 + " !")
+            print(f"!  Output filename changed:")
+            print(f"!    {original_name}")
+            print(f"!    -> {output_path}")
+            print("! " + "-"*58 + " !")
+            print(f"!  Reason: --background-alpha {bg_alpha:g} produces a")
+            print(f"!  transparent video, which requires the VP9/WebM")
+            print(f"!  container. Use --background-alpha 1 to force MP4.")
+            print("! " + "-"*58 + " !\n")
+            if output_path.exists():
+                alt = output_path.with_name(
+                    output_path.stem + '_new' + output_path.suffix)
+                print(f"!  WARNING: {output_path} already exists;")
+                print(f"!  writing to {alt} instead\n")
+                output_path = alt
 
     # ---- Resolve reuse ----
     state = load_state()
@@ -950,7 +1064,9 @@ Examples:
                     leave_black_empty=args.leave_black_empty,
                     black_threshold=args.black_threshold,
                     jobs=args.jobs, ascii_files=ascii_files,
-                    colorized=args.colorized)
+                    colorized=args.colorized,
+                    bg_color_rgb=bg_color_rgb,
+                    bg_alpha=bg_alpha)
             else:
                 # Fresh (or reuse 'extracted'): grid is analytic
                 from PIL import Image
@@ -970,7 +1086,9 @@ Examples:
                     black_threshold=args.black_threshold,
                     jobs=args.jobs,
                     txt_dir=(temp_dir / 'txt_frames') if args.keep_temp else None,
-                    colorized=args.colorized)
+                    colorized=args.colorized,
+                    bg_color_rgb=bg_color_rgb,
+                    bg_alpha=bg_alpha)
 
         state['grid'] = {
             'ascii_width': max_cols, 'rows': max_rows,
@@ -984,6 +1102,8 @@ Examples:
             'colorized': args.colorized,
             'leave_black_empty': args.leave_black_empty,
             'black_threshold': args.black_threshold,
+            'bg_color': args.background_color,
+            'bg_alpha': bg_alpha,
         }
         state['counts']['ascii_files'] = (count_dir(reuse_dir / 'txt_frames')
                                           if reuse_level in ('ascii',)
@@ -1000,12 +1120,12 @@ Examples:
         if reuse_level == 'final':
             # Resolution may differ from the run that created these frames
             validate_reuse_frame_sizes(reuse_dir, state, tw, th)
-            assemble_video(rendered_images, output_path, fps, input_path,
-                           has_audio, tw, th, check_frames=True)
-        else:
-            # Normal run (or non-final reuse): frames were just rendered at target
-            assemble_video(rendered_images, output_path, fps, input_path,
-                           has_audio, tw, th, check_frames=False)
+
+        # Normal run (or non-final reuse): frames were just rendered at target
+        assemble_video(rendered_images, output_path, fps, input_path,
+                       has_audio, tw, th, check_frames=(reuse_level == 'final'),
+                       bg_alpha=bg_alpha,
+                       vpx_preset=args.vpx_preset)
         print(f"  Final output: {output_path}")
         print()
 
