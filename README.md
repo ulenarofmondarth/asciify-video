@@ -14,6 +14,7 @@ Convert green-screen video to ASCII art video with consistent output geometry, m
 - **Vertical stripe artifacts are eliminated** (custom Python rasterizer replaces buggy jp2a)
 - **Performance is optimized** via ProcessPoolExecutor parallelization
 - **Iteration is fast** via artifact reuse (`--reuse extracted|ascii|final`)
+- **Backgrounds are flexible** — any color, fully transparent, or anywhere in between
 - **Everything is documented** via JSON state files and `--report`
 
 ## Features
@@ -22,7 +23,10 @@ Convert green-screen video to ASCII art video with consistent output geometry, m
 |---------|-------------|
 | **Auto green detection** | Samples corner regions to find optimal key color |
 | **Manual key override** | Specify exact hex color with `--key-color` |
-| **Chromakey-to-black** | Composites keyed subject over black background |
+| **Chromakey-to-background** | Composites keyed subject over a selectable background |
+| **Background color & alpha** | Any CSS hex color; opacity 0-1, including full transparency (`--background-color`, `--background-alpha`) |
+| **Automatic WebM selection** | Alpha output automatically targets `.webm`, renaming the output file with a prominent notice |
+| **VP9 speed control** | Tune alpha encode speed with `--vpx-preset` |
 | **Direct luminance mapping** | Custom Python rasterizer (no external `jp2a` dependency) |
 | **Parallel processing** | Multi-core conversion and rendering via `ProcessPoolExecutor` |
 | **Histogram stretching** | Global luminance remapping (`--hist-stretch`) prevents per-frame brightness pumping |
@@ -30,6 +34,7 @@ Convert green-screen video to ASCII art video with consistent output geometry, m
 | **Target resolution** | Consistent output geometry regardless of input resolution |
 | **Black masking** | Leave dark areas empty (`--leave-black-empty --black-threshold`) |
 | **Artifact reuse** | Skip costly stages by reusing intermediates (`--reuse`) |
+| **Reuse-aware messaging** | Flags CLI options that have no effect at the chosen reuse level |
 | **JSON state tracking** | Run metadata persisted to `~/.cache/asciify/state.json` |
 | **Progress reporting** | `--report` shows last run's state; `--state-file` dumps raw JSON |
 
@@ -38,7 +43,7 @@ Convert green-screen video to ASCII art video with consistent output geometry, m
 ### System dependencies
 
 - **Python 3.8+**
-- **FFmpeg** (with chromakey and libx264 support)
+- **FFmpeg** (with chromakey, libx264, libvpx-vp9, and ideally libopus support)
 - **ffprobe** (shipped with FFmpeg)
 
 Install via your package manager:
@@ -53,6 +58,16 @@ brew install ffmpeg
 # Windows
 # Download from https://ffmpeg.org/download.html or use winget/choco
 winget install ffmpeg
+```
+
+Verify alpha support in your build:
+
+```bash
+ffmpeg -encoders | grep vpx
+# Expected: libvpx and libvpx-vp9 entries
+
+ffmpeg -encoders | grep opus
+# Expected: libopus (audio in alpha mode falls back to Vorbis if absent)
 ```
 
 ### Python dependencies
@@ -104,6 +119,64 @@ This will:
 ./asciify.py input.mp4 output.mp4 --colorized
 ```
 
+## Background Color & Transparency
+
+The background behind the ASCII characters is selectable in both color and opacity:
+
+```bash
+# Opaque white background (standard MP4)
+./asciify.py input.mp4 out.mp4 --background-color '#FFFFFF' --background-alpha 1
+
+# Opaque custom color
+./asciify.py input.mp4 out.mp4 --background-color '#102030' --background-alpha 1
+
+# Semi-transparent background (WebM)
+./asciify.py input.mp4 out --background-color '#000000' --background-alpha 0.5
+
+# Fully transparent background (WebM) - ideal for overlays
+./asciify.py input.mp4 out --background-alpha 0
+```
+
+### Automatic WebM selection
+
+Alpha transparency requires the VP9/WebM container. When `--background-alpha` is below 1 and the output filename does not already end in `.webm`, the script renames it for you and prints a prominent notice before anything else runs:
+
+```
+! ---------------------------------------------------------- !
+!              NOTE: alpha output requires WebM              !
+! ---------------------------------------------------------- !
+!  Output filename changed:
+!    out.mp4
+!    -> out.webm
+! ---------------------------------------------------------- !
+!  Reason: --background-alpha 0.5 produces a
+!  transparent video, which requires the VP9/WebM
+!  container. Use --background-alpha 1 to force MP4.
+! ---------------------------------------------------------- !
+```
+
+If the renamed target already exists, the script writes to `<name>_new.webm` instead of overwriting it.
+
+### Output format rules
+
+| Setting | Format | Audio | Notes |
+|---------|--------|-------|-------|
+| `--background-alpha 1` | MP4 (H.264) | AAC, preserved | Standard opaque video |
+| `--background-alpha 0-0.99` | WebM (VP9 + alpha) | Opus (Vorbis fallback), preserved | `yuva420p` pixel format |
+| `--background-alpha 0` | WebM (VP9 + alpha) | Opus (Vorbis fallback), preserved | Pure transparency for overlay use |
+
+### VP9 encode speed
+
+Alpha encoding with VP9 can be slow. Control the speed/quality trade-off:
+
+```bash
+./asciify.py input.mp4 out --background-alpha 0 --vpx-preset ultrafast  # fastest (default)
+./asciify.py input.mp4 out --background-alpha 0 --vpx-preset medium    # slower, better quality
+./asciify.py input.mp4 out --background-alpha 0 --vpx-preset slow      # best quality, ~10x slower
+```
+
+Presets map to VP9 `cpu-used` values from 8 (ultrafast) down to 0 (slow).
+
 ## Advanced Usage
 
 ### Artifact reuse (iteration workflow)
@@ -114,10 +187,10 @@ The `--keep-temp` flag preserves intermediate artifacts for rapid iteration:
 # First run: keep all intermediates
 ./asciify.py input.mp4 output1.mp4 --keep-temp
 
-# Later: tweak only render settings (fonts, colors, masking)
+# Later: tweak only render settings (fonts, colors, backgrounds, masking)
 ./asciify.py input.mp4 output2.mp4 --reuse ascii --render-font-size 96
 
-# Even later: tweak only encode settings (FPS, CRF, audio)
+# Even later: tweak only encode settings (FPS, resolution, audio)
 ./asciify.py input.mp4 output3.mp4 --reuse final --fps 60
 ```
 
@@ -126,8 +199,32 @@ The `--keep-temp` flag preserves intermediate artifacts for rapid iteration:
 | Level | Skips stages | Reuses from disk | Typical iteration |
 |-------|--------------|------------------|-------------------|
 | `extracted` | keying, chromakey, extraction | frames/*.png | Fix key color and retry |
-| `ascii` | keying, chromakey, extraction, conversion | txt_frames/*.txt, frames/*.png | Tweak rendering (font, colors, masking) |
-| `final` | all stages above + rendering | images/rendered_*.png | Tune encoder (FPS, CRF, audio bitrate) |
+| `ascii` | + conversion | txt_frames/*.txt, frames/*.png | Tweak rendering (font, colors, masking, background) |
+| `final` | + rendering | images/rendered_*.png | Tune encoder (FPS, resolution, audio) |
+
+#### What still works at each level
+
+Each reuse level freezes everything upstream of it, so some CLI options become inert. The script tells you exactly which ones:
+
+```
+$ ./asciify.py input.mp4 out.mp4 --reuse final --background-alpha 0.5
+  Reusing artifacts from: /var/folders/.../asciify_x1y2
+  Level: final  (frames=108, ascii=108, rendered=108)
+  Stages skipped: keying, conversion, rendering
+  No effect at this level: --ascii-width, --background-alpha, --background-color,
+    --black-threshold, --colorized, --detect-green, --edge-blending,
+    --hist-stretch, --jobs, --key-color, --leave-black-empty, --no-key,
+    --ramp, --render-font-size, --sample-region, --scale-divisor, --tolerance
+    !! --background-alpha was passed but is IGNORED (--reuse final)
+  Still honored: --fps, --target-resolution (frames rescaled at assembly), audio mapping
+  Note: background color/alpha, font, and masking are baked into the reused frames
+```
+
+Summary:
+
+- **`extracted`**: conversion and rendering options all work (`--ascii-width`, `--ramp`, `--hist-stretch`, fonts, backgrounds)
+- **`ascii`**: rendering options still work — including `--background-color`, `--background-alpha`, `--colorized`, and `--leave-black-empty` — since rendering re-runs from the reused text. The character grid comes from the stored text files, so `--ascii-width` is advisory only.
+- **`final`**: background, font, and masking options are baked into the reused frames and have no effect. `--fps`, `--target-resolution` (assembly rescales frames), and audio mapping are still honored.
 
 ### State inspection
 
@@ -139,6 +236,24 @@ The `--keep-temp` flag preserves intermediate artifacts for rapid iteration:
 ./asciify.py --state-file
 
 # Both work standalone; no input/output args needed
+```
+
+Example `--report` output:
+
+```
+State file: /home/user/.cache/asciify/state.json
+Updated:    2026-10-06T14:22:31
+Input:      input.mp4
+Temp dir:   /var/folders/.../asciify_x1y2  (present)
+Completed:  yes
+Stages:     probe, key, extract, ascii, render, assemble
+Source:     1920x1080 @ 24.00 fps, audio=yes
+Keying:     0x00B140 (auto-detected), tol=0.25, blend=0.05
+Grid:       160 cols x 135 rows, stretch=off, ramp='default'
+Render:     1920x1080, font=64, color=mono, black-empty=off
+Background: #000000, alpha=0.00  (transparent WebM)
+Artifacts:  frames=108, ascii=108, rendered=108
+Last output: output.webm
 ```
 
 ### Environment override for reuse directory
@@ -171,7 +286,7 @@ export ASCII_VIDEO_TEMP=/path/to/previous/temp
 | Flag | Default | Description |
 |------|---------|-------------|
 | `input` | *(required)* | Input video file path |
-| `output` | *(required)* | Output ASCII video file path |
+| `output` | *(required)* | Output ASCII video file path (auto-renamed to `.webm` when alpha < 1) |
 | `--key-color` | auto-detect | Key color in hex (e.g., `0x00B140`) |
 | `--detect-green` | off | Force green detection even if `--key-color` given |
 | `--tolerance` | 0.25 | Chromakey tolerance (0-1) |
@@ -184,6 +299,9 @@ export ASCII_VIDEO_TEMP=/path/to/previous/temp
 | `--colorized` | off | Render characters in source colors |
 | `--leave-black-empty` | off | Leave dark areas as true emptiness |
 | `--black-threshold` | 50 | Brightness threshold for "black" (0-255) |
+| `--background-color` | `#000000` | Background color, CSS hex (`#RRGGBB`) |
+| `--background-alpha` | 1 | Background opacity 0-1 (below 1 selects WebM) |
+| `--vpx-preset` | `ultrafast` | VP9 encode speed for alpha: `ultrafast`, `veryfast`, `faster`, `fast`, `medium`, `slow` |
 | `--hist-stretch` | off | Global histogram stretch before mapping |
 | `--sample-region` | `corners` | Sampling region: `corners`, `center`, `full`, or `WxH+X+Y` |
 | `--render-font-size` | 64 | Font rasterization quality |
@@ -202,12 +320,12 @@ export ASCII_VIDEO_TEMP=/path/to/previous/temp
 
 ```
 Probe --> Keying --> Extract --> ASCII Convert --> Render --> Assemble
-(meta)  (chroma)   (PNG)      (fused parallel)  (images)  (MP4)
+(meta)  (chroma)   (PNG)      (fused parallel)  (images)  (MP4/WebM)
 ```
 
 ### Fused parallel convert+render
 
-Unlike earlier designs that wrote intermediate `.txt` files between stages, the current pipeline fuses conversion and rendering into a single worker function:
+The pipeline fuses conversion and rendering into a single worker function:
 
 ```
 Worker 1: PNG --> ASCII (in memory) --> Rendered PNG
@@ -219,7 +337,7 @@ Intermediate text files exist **only** when `--keep-temp` is specified, primaril
 
 ### Analytic grid calculation
 
-The character grid is computed analytically from `--target-resolution` and `--ascii-width`, eliminating the need for pre-scanning all ASCII files:
+The character grid is computed analytically from `--target-resolution` and `--ascii-width`:
 
 ```
 max_cols = --ascii-width (user setting)
@@ -230,6 +348,13 @@ cell_h = --target_height / max_rows
 
 This guarantees **identical character dimensions** across all videos rendered with the same target settings.
 
+### Alpha-aware rendering and assembly
+
+Rendered frames are RGBA images: the background layer carries the user-selected color at the user-selected alpha, while all glyphs remain fully opaque. During assembly:
+
+- **Opaque output** (`--background-alpha 1`): H.264/MP4 with AAC audio.
+- **Alpha output** (below 1): PNGs are fed to ffmpeg with the input pixel format forced to RGBA (preventing a format-negotiation hang in some builds), encoded as VP9 `yuva420p` WebM with a configurable `cpu-used` speed, realtime deadline, and row-based multithreading enabled. Audio is re-encoded as Opus, falling back to Vorbis if the build lacks `libopus`.
+
 ### State file schema
 
 Stored at `~/.cache/asciify/state.json`:
@@ -237,7 +362,7 @@ Stored at `~/.cache/asciify/state.json`:
 ```json
 {
   "version": 1,
-  "updated": "2026-10-05T21:40:12",
+  "updated": "2026-10-06T14:22:31",
   "input": "/path/to/input.mp4",
   "temp_dir": "/var/folders/.../asciify_xyz",
   "keep_temp": true,
@@ -268,14 +393,16 @@ Stored at `~/.cache/asciify/state.json`:
     "font_size": 64,
     "colorized": false,
     "leave_black_empty": false,
-    "black_threshold": 50
+    "black_threshold": 50,
+    "bg_color": "#000000",
+    "bg_alpha": 0.0
   },
   "counts": {
     "frames": 108,
     "ascii_files": 108,
     "rendered_images": 108
   },
-  "output": "/path/to/output.mp4",
+  "output": "/path/to/output.webm",
   "duration_s": 127.4
 }
 ```
@@ -308,6 +435,31 @@ The reuse validation checks that all required artifact directories exist and con
 
 Solution: re-run with `--keep-temp` from scratch, or specify a different `--reuse-dir`.
 
+### Alpha encoding hangs or fails
+
+The script checks for `libvpx-vp9` before alpha encoding and exits with guidance if it's missing. If encoding is merely slow, lower the preset:
+
+```bash
+./asciify.py input.mp4 out --background-alpha 0 --vpx-preset ultrafast
+```
+
+Some ffmpeg builds deadlock feeding RGBA PNGs to libvpx-vp9; asciify forces `-pix_fmt rgba` at the input stage to prevent this. If hangs persist with your build, try a static ffmpeg build (e.g., from johnvansickle.com, Linux) or Homebrew's current build (macOS), which handle alpha pipelines reliably.
+
+To verify an alpha encode after the fact:
+
+```bash
+ffprobe -v error -show_entries stream=pix_fmt output.webm
+# Look for "yuva420p"
+```
+
+### Transparent background renders as black
+
+The alpha channel is present in the file; your player does not support VP9 alpha. Chromium, Firefox, and recent mpv builds display VP9 alpha correctly; QuickTime and some older players show solid black. If you need broad player compatibility, render opaque (`--background-alpha 1`) and composite in post.
+
+### A flag is reported as IGNORED during `--reuse`
+
+Options affecting stages before your reuse point have no effect, since those stages are skipped. The `!!` lines in the reuse banner flag any you actually passed. Move that setting to a lower reuse level, or run without `--reuse`.
+
 ### Font loading failure
 
 `asciify.py` searches standard paths on Linux/macOS/Windows and falls back to scalable defaults. If you get font errors, check:
@@ -317,13 +469,6 @@ fc-list : monospace                                      # Linux
 find /System/Library/Fonts -name "*.ttf" | grep -i mono  # macOS
 dir C:\Windows\Fonts\*mono*                             # Windows
 ```
-
-### Vertical striping in output
-
-This was a known bug in the removed `jp2a` tool. The current version uses a pure-Python rasterizer. If striping appears, it indicates either:
-
-1. Outdated installation (ensure you're using v3+)
-2. Corrupted temp files (delete `~/.cache/asciify` and re-run)
 
 ### "Cannot write empty image" crash
 
@@ -335,10 +480,9 @@ The script handles blank frames gracefully. If you still encounter this, verify:
 
 ## Performance Notes
 
-FFmpeg stages (chromakey, extraction, assembly) are single-command and not parallelized; the Python convert+render stage scales with `--jobs`. Parallelization benefits grow with:
+FFmpeg stages (chromakey, extraction, assembly) are single-command and not parallelized; the Python convert+render stage scales with `--jobs`. Parallelization benefits grow with higher resolution and longer clips.
 
-- Higher resolution (more pixels per frame)
-- Longer duration (more frames)
+For alpha output specifically, VP9 encoding dominates assembly time; `--vpx-preset` trades speed against quality, with `ultrafast` (`cpu-used 8`) completing roughly an order of magnitude faster than `slow` (`cpu-used 0`).
 
 ### Memory usage
 
@@ -378,10 +522,16 @@ chmod +x asciify.py       # Make executable (Linux/macOS)
 - [ ] `--hist-stretch` preventing brightness pumping
 - [ ] `--colorized` mode producing correct per-cell colors
 - [ ] `--target-resolution` consistency across inputs
-- [ ] `--reuse` levels validating and skipping correctly
+- [ ] Background colors rendering correctly (opaque)
+- [ ] Alpha transparency surviving to final WebM (`yuva420p` verified via ffprobe)
+- [ ] Automatic `.webm` rename notice displayed for non-webm output names with alpha < 1
+- [ ] Existing output file collision handled (`_new` suffix, no overwrite)
+- [ ] Audio preserved in alpha mode (Opus, Vorbis fallback)
+- [ ] VP9 speed presets varying encode time as expected
+- [ ] `--reuse` levels validating, skipping, and reporting ignored flags correctly
 - [ ] `--keep-temp` creating and recording state
-- [ ] `--report` displaying accurate last-run info
-- [ ] Blank frame handling (empty subjects)
+- [ ] `--report` displaying accurate last-run info including background fields
+- [ ] Blank frame handling (empty subjects, including transparent blanks)
 - [ ] Cross-platform font fallback
 
 ## License
