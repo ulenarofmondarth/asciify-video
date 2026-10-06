@@ -516,10 +516,11 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
 # ------------------------------- Assembly ----------------------------------
 
 def assemble_video(rendered_images, output_path, fps, source_video,
-                   has_audio):
+                   has_audio, target_width, target_height, check_frames=True):
     """Assemble rendered frames into the final video.
 
-    Frames arrive at exact target size; no scale filter needed.
+    check_frames: if True, verify first frame matches target size (for --reuse)
+                  and adds scale filter only on mismatch.
     """
     print("  Assembling video...")
     pattern = str(Path(rendered_images[0]).parent / 'rendered_*.png')
@@ -530,6 +531,29 @@ def assemble_video(rendered_images, output_path, fps, source_video,
            '-i', pattern]
     if has_audio and source_video is not None and Path(source_video).exists():
         cmd += ['-i', str(source_video)]
+
+    # Optional: verify and possibly scale
+    if check_frames and rendered_images and Path(rendered_images[0]).exists():
+        from PIL import Image
+        try:
+            frame = Image.open(rendered_images[0])
+            fw, fh = frame.size
+            frame.close()
+
+            if fw != target_width or fh != target_height:
+                print(f"  Scaling: {fw}x{fh} → {target_width}x{target_height}")
+                cmd += ['-vf',
+                        f'scale={target_width}:{target_height}:flags=lanczos']
+            else:
+                print(f"  Frames at target: {fw}x{fh}")
+        except Exception as e:
+            print(f"  Warning: Could not probe frame size: {e}")
+            cmd += ['-vf',
+                    f'scale={target_width}:{target_height}:flags=lanczos']
+    elif check_frames:
+        # No frames to probe — assume scale needed
+        cmd += ['-vf',
+                f'scale={target_width}:{target_height}:flags=lanczos']
 
     cmd += ['-map', '0:v']
     if has_audio and source_video is not None and Path(source_video).exists():
@@ -567,6 +591,37 @@ def validate_reuse(reuse_dir, level):
                 f"--reuse {level}: missing or empty '{d}'. "
                 f"Re-run with --keep-temp first, or point --reuse-dir at "
                 f"a complete temp directory.")
+
+def validate_reuse_frame_sizes(reuse_dir, state, target_width, target_height):
+    """Check one rendered frame matches the state's recorded target size."""
+    img_dir = reuse_dir / 'images'
+    sample = next(img_dir.glob('rendered_*.png'), None)
+    if not sample:
+        return True   # nothing to validate
+
+    try:
+        from PIL import Image
+        frame = Image.open(sample)
+        fw, fh = frame.size
+        frame.close()
+
+        st_tw = state.get('render', {}).get('target_width')
+        st_th = state.get('render', {}).get('target_height')
+
+        # Check actual frame size against current target
+        if fw != target_width or fh != target_height:
+            print(f"  Warning: reused frames are {fw}x{fh}, "
+                  f"target is {target_width}x{target_height}; "
+                  f"will scale during assembly")
+
+        # Also check against state-file claim (sanity check)
+        if st_tw and st_th and (fw != st_tw or fh != st_th):
+            print(f"  Note: state claims {st_tw}x{st_th}, "
+                  f"frame is {fw}x{fh}; possible mismatch")
+        return True
+    except Exception as e:
+        print(f"  Warning: Could not validate frame size: {e}")
+        return False
 
 def frame_num(p):
     stem = Path(p).stem
@@ -941,8 +996,16 @@ Examples:
 
         # ---- Stage 7: Assemble ----
         print("[7/6] Assembling final video...")
-        assemble_video(rendered_images, output_path, fps, input_path,
-                       has_audio)
+        # ---- Stage 7: Assemble ----
+        if reuse_level == 'final':
+            # Resolution may differ from the run that created these frames
+            validate_reuse_frame_sizes(reuse_dir, state, tw, th)
+            assemble_video(rendered_images, output_path, fps, input_path,
+                           has_audio, tw, th, check_frames=True)
+        else:
+            # Normal run (or non-final reuse): frames were just rendered at target
+            assemble_video(rendered_images, output_path, fps, input_path,
+                           has_audio, tw, th, check_frames=False)
         print(f"  Final output: {output_path}")
         print()
 
