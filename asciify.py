@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env pythone
 """
 Green Screen to ASCII Video Converter v3
 
@@ -32,7 +32,22 @@ from tqdm import tqdm
 
 # ------------------------------- Constants --------------------------------
 
-DEFAULT_RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+DEFAULT = {
+    'RAMP': " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
+    'FONT-COLOR': '#64FF64',
+    'KEY-COLOR': 'auto-detect',
+    'TOLERANCE': 0.25,
+    'EDGE-BLEEDING': 0.05,
+    'SCALE-DIVISOR': 8,
+    'ASCII-WIDTH': 160,
+    'BLACK-THRESHOLD': 50,
+    'SAMPLE-REGION': 'corners',
+    'RASTERIZATION-QUALITY': 64,
+    'BACKGROUND-COLOR': '#000000',
+    'BACKGROUND-ALPHA': 1,
+    'VPX-PRESET': 'ultrafast',
+}
+
 JP2A_RAMP = " .',;:clodxkO0KXNWM"
 
 STATE_DIR = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'asciify'
@@ -67,6 +82,18 @@ REUSE_SKIPPED_STAGES = {
     'ascii':     ['keying', 'conversion'],
     'final':     ['keying', 'conversion', 'rendering'],
 }
+
+# ------------------------------ Run state ----------------------------------
+
+def _color_as_rgb(fc_hex):
+    color_hex = fc_hex.lstrip('#')
+    color_rgb = (
+        int(color_hex[0:2], 16),
+        int(color_hex[2:4], 16),
+        int(color_hex[4:6], 16),
+    )
+    return color_rgb
+
 
 # ------------------------------ Run state ----------------------------------
 
@@ -143,7 +170,7 @@ def report_state(state):
         if r.get('colorized'):
             color_note = 'source'
         else:
-            color_note = r.get('font_color', '#64FF64')
+            color_note = r.get('font_color', DEFAULT['FONT-COLOR'])
         print(f"Render:     {r['target_width']}x{r['target_height']}, "
               f"font={r.get('font_size')}, color={color_note}, "
               f"black-empty={'on' if r.get('leave_black_empty') else 'off'}"
@@ -199,7 +226,7 @@ def _flattened_pixels(img):
     n = len(img.getbands())          # 3 for RGB
     return [tuple(data[i:i + n]) for i in range(0, len(data), n)]
 
-def sample_green_color(input_path, sample_frames=10, region='corners',
+def sample_green_color(input_path, sample_frames=10, region=DEFAULT['SAMPLE-REGION'],
                        src_width=300, src_height=300):
     """Sample frames and detect a green key color.
 
@@ -521,10 +548,10 @@ def _process_one_frame(task):
     return out_path, ascii_text
 
 def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
-                              leave_black_empty=False, black_threshold=50,
+                              leave_black_empty=False, black_threshold=DEFAULT['BLACK-THRESHOLD'],
                               jobs=None, ascii_files=None, txt_dir=None,
-                              colorized=False, bg_color_rgb=(0, 0, 0),
-                              bg_alpha=0.0, font_color_rgb=(100, 255, 100)):
+                              colorized=False, bg_color_rgb=_color_as_rgb(DEFAULT['BACKGROUND-COLOR']),
+                              bg_alpha=DEFAULT['BACKGROUND-ALPHA'], font_color_rgb=_color_as_rgb(DEFAULT['FONT-COLOR'])):
     """Fused parallel convert+render.
 
     ascii_files: None to convert from frames (fused); or a list of .txt
@@ -574,7 +601,7 @@ def frames_to_rendered_images(frames, img_dir, metrics, ramp, stretch,
 # ------------------------------- Assembly ----------------------------------
 def assemble_video(rendered_images, output_path, fps, source_video,
                    has_audio, target_width, target_height,
-                   check_frames=True, bg_alpha=0.0, vpx_preset='ultrafast'):
+                   check_frames=True, bg_alpha=DEFAULT['BACKGROUND-ALPHA'], vpx_preset=DEFAULT['VPX-PRESET']):
     """Assemble rendered frames into the final video."""
     print("  Assembling video...")
     pattern = str(Path(rendered_images[0]).parent / 'rendered_*.png')
@@ -643,8 +670,7 @@ def assemble_video(rendered_images, output_path, fps, source_video,
 
     if use_alpha:
         # VP9 with alpha - simplified parameters that don't hang
-        speed_val = {'ultrafast': 8, 'veryfast': 6, 'faster': 4,
-                     'fast': 2, 'medium': 1, 'slow': 0}.get(vpx_preset, 4)
+        speed_val = vpx_speed_to_int(vpx_preset)
         print(f"  VP9 preset: {vpx_preset} (cpu-used={speed_val})")
         cmd += ['-c:v', 'libvpx-vp9',
                 '-crf', '20',
@@ -801,20 +827,20 @@ Examples:
     parser.add_argument('output', type=str, nargs='?',
                         help='Output ASCII video file path')
     parser.add_argument('--key-color', type=str, default=None,
-                        help='Key color in hex format (default: auto-detect)')
+                        help=f'Key color in hex format (default: {DEFAULT["KEY-COLOR"]}')
     parser.add_argument('--detect-green', action='store_true',
                         help='Force green color detection even if --key-color provided')
-    parser.add_argument('--tolerance', type=float, default=0.25,
-                        help='Chromakey tolerance (default: 0.25)')
-    parser.add_argument('--edge-blending', type=float, default=0.05,
-                        help='Chromakey edge blending (default: 0.05)')
+    parser.add_argument('--tolerance', type=float, default=DEFAULT['TOLERANCE'],
+                        help=f'Chromakey tolerance (default: {DEFAULT["TOLERANCE"]})')
+    parser.add_argument('--edge-blending', type=float, default=DEFAULT["EDGE-BLEEDING"],
+                        help=f'Chromakey edge blending (default: {DEFAULT["EDGE-BLEEDING"]})')
     parser.add_argument('--fps', type=float, default=None,
                         help='Override output FPS (default: from input)')
-    parser.add_argument('--scale-divisor', type=int, default=8,
+    parser.add_argument('--scale-divisor', type=int, default=DEFAULT['SCALE-DIVISOR'],
                         help='Default ascii width = source width / this '
-                             'when --ascii-width not given (default: 8)')
-    parser.add_argument('--ascii-width', type=int, default=160,
-                        help='ASCII grid width in characters (default: 160)')
+                             f'when --ascii-width not given (default: {DEFAULT["SCALE-DIVISOR"]})')
+    parser.add_argument('--ascii-width', type=int, default=DEFAULT['ASCII-WIDTH'],
+                        help=f'ASCII grid width in characters (default: {DEFAULT["ASCII-WIDTH"]})')
     parser.add_argument('--ramp', type=str, default=None,
                         help="'jp2a' or a custom ramp string "
                              "(default: full density ramp)")
@@ -823,17 +849,17 @@ Examples:
                              'instead of monochrome green')
     parser.add_argument('--leave-black-empty', action='store_true',
                         help='Leave black areas empty (no ASCII characters)')
-    parser.add_argument('--black-threshold', type=int, default=50,
-                        help='Brightness threshold for "black" (default: 50)')
+    parser.add_argument('--black-threshold', type=int, default=DEFAULT['BLACK-THRESHOLD'],
+                        help=f'Brightness threshold for "black" (default: {DEFAULT["BLACK-THRESHOLD"]})')
     parser.add_argument('--hist-stretch', action='store_true',
                         help='Global histogram stretch before character mapping')
     parser.add_argument('--no-key', action='store_true',
                         help='Skip chromakey stage entirely')
-    parser.add_argument('--sample-region', type=str, default='corners',
+    parser.add_argument('--sample-region', type=str, default=DEFAULT['SAMPLE-REGION'],
                         help='Key color sampling region: corners, center, '
-                             'full, or WxH+X+Y (default: corners)')
-    parser.add_argument('--render-font-size', type=int, default=64,
-                        help='Font rasterization quality (default: 64)')
+                             f'full, or WxH+X+Y (default: {DEFAULT["SAMPLE-REGION"]})')
+    parser.add_argument('--render-font-size', type=int, default=DEFAULT['RASTERIZATION-QUALITY'],
+                        help=f'Font rasterization quality (default: {DEFAULT["RASTERIZATION-QUALITY"]})')
     parser.add_argument('--target-resolution', type=str, default=None,
                         help='Target WIDTHxHEIGHT, e.g. 1920x1080 '
                              '(default: source dimensions)')
@@ -855,16 +881,16 @@ Examples:
                         help='Print recorded state of the last run and exit')
     parser.add_argument('--state-file', action='store_true',
                         help='Print the raw state JSON and exit')
-    parser.add_argument('--background-color', type=str, default='#000000',
-                        help='Background color in CSS hex format (default: black)')
-    parser.add_argument('--background-alpha', type=float, default=1,
-                        help='Background opacity 0-1 (0=transparent, 1=opaque; default: 1)')
-    parser.add_argument('--vpx-preset', type=str, default='ultrafast',
+    parser.add_argument('--background-color', type=str, default=DEFAULT['BACKGROUND-COLOR'],
+                        help=f'Background color in CSS hex format (default: {DEFAULT["BACKGROUND-COLOR"]})')
+    parser.add_argument('--background-alpha', type=float, default=DEFAULT['BACKGROUND-ALPHA'],
+                        help=f'Background opacity 0-1 (0=transparent, 1=opaque; default: {DEFAULT["BACKGROUND-ALPHA"]})')
+    parser.add_argument('--vpx-preset', type=str, default=DEFAULT['VPX-PRESET'],
                         choices=['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
-                        help='VP9 encoding speed for alpha output (default: ultrafast)')
+                        help=f'VP9 encoding speed for alpha output (default: {DEFAULT["VPX-PRESET"]})')
     parser.add_argument('--font-color', type=str, default=None,
                         help='Character color in CSS hex format '
-                             '(default: #64FF64, the classic terminal green). '
+                             f'(default: {DEFAULT["FONT-COLOR"]}, the classic terminal green). '
                              'Incompatible with --colorized')
 
     args = parser.parse_args()
@@ -895,13 +921,8 @@ Examples:
     TQDM_DISABLED = args.silent_progress
 
     # Parse background color
-    bg_color_hex = args.background_color.lstrip('#')
     try:
-        bg_color_rgb = (
-            int(bg_color_hex[0:2], 16),
-            int(bg_color_hex[2:4], 16),
-            int(bg_color_hex[4:6], 16)
-        )
+        bg_color_rgb = _color_as_rgb(args.background_color.lstrip('#'))
     except (ValueError, IndexError):
         print(f"Error: Invalid background color '{args.background_color}'. "
               f"Use CSS hex format (e.g., #RRGGBB)")
@@ -939,20 +960,12 @@ Examples:
         print("       leaving no role for a uniform --font-color.")
         sys.exit(1)
 
-    if args.font_color:
-        fc_hex = args.font_color.lstrip('#')
-        try:
-            font_color_rgb = (
-                int(fc_hex[0:2], 16),
-                int(fc_hex[2:4], 16),
-                int(fc_hex[4:6], 16),
-            )
-        except (ValueError, IndexError):
-            print(f"Error: Invalid font color '{args.font_color}'. "
-                  f"Use CSS hex format (e.g., #64FF64)")
-            sys.exit(1)
-    else:
-        font_color_rgb = (100, 255, 100)
+    try:
+        font_color_rgb = _color_as_rgb(args.font_color or DEFAULT['FONT-COLOR'])
+    except (ValueError, IndexError):
+        print(f"Error: Invalid font color '{args.font_color}'. "
+              f"Use CSS hex format (e.g., #64FF64)")
+        sys.exit(1)
 
     # ---- Resolve reuse ----
     state = load_state()
@@ -1016,7 +1029,7 @@ Examples:
         elif args.ramp:
             ramp = args.ramp
         else:
-            ramp = DEFAULT_RAMP
+            ramp = DEFAULT['RAMP']
 
         state['probe'] = {'width': width, 'height': height, 'fps': fps,
                           'has_audio': has_audio}
@@ -1191,7 +1204,7 @@ Examples:
             'ascii_width': max_cols, 'rows': max_rows,
             'stretch': list(stretch) if stretch else None,
             'ramp': ('jp2a' if ramp == JP2A_RAMP
-                     else ('default' if ramp == DEFAULT_RAMP else ramp)),
+                     else ('default' if ramp == DEFAULT['RAMP'] else ramp)),
         }
         state['render'] = {
             'target_width': tw, 'target_height': th,

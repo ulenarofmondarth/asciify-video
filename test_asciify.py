@@ -75,7 +75,7 @@ class TestNoDeprecatedPillowUsage:
 # Helpers / fixtures
 # --------------------------------------------------------------------------
 
-RAMP = asciify.DEFAULT_RAMP
+RAMP = asciify.DEFAULT['RAMP']
 
 def gray_png(path, value, w=8, h=4):
     """Write a grayscale PNG that reads back as `value` luminance."""
