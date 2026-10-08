@@ -1,4 +1,4 @@
-#!/usr/bin/env pythone
+#!/usr/bin/env python3
 """
 Green Screen to ASCII Video Converter v3
 
@@ -15,7 +15,6 @@ Key features:
 - --keep-temp with JSON state file; --report; --reuse extracted|ascii|final
 """
 
-import argparse
 import datetime
 import glob
 import json
@@ -27,6 +26,8 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 from tqdm import tqdm
 
@@ -767,232 +768,79 @@ def frame_num(p):
     digits = ''.join(ch for ch in stem if ch.isdigit())
     return int(digits) if digits else 0
 
-def report_reuse_semantics(reuse_level):
-    """Explain which options are dead and which still work at this reuse level,
-    highlighting anything the user actually passed."""
-    skipped = REUSE_SKIPPED_STAGES[reuse_level]
-    ignored = sorted({f for s in skipped for f in STAGE_FLAG_MAP.get(s, [])})
-
-    print(f"  Stages skipped: {', '.join(skipped)}")
-    if ignored:
-        print(f"  No effect at this level: {', '.join(ignored)}")
-
-    # Did the user actually pass any of the dead flags?
-    passed = []
-    for arg in sys.argv[1:]:
-        flag_name = arg.split('=')[0]
-        if flag_name in ignored:
-            passed.append(flag_name)
-
-    for f in sorted(set(passed)):
-        print(f"    !! {f} was passed but is IGNORED (--reuse {reuse_level})")
-
-    if reuse_level == 'final':
-        print("  Still honored: --fps, --target-resolution "
-              "(frames rescaled at assembly), audio mapping")
-        print("  Note: background color/alpha, font, and masking are "
-              "baked into the reused frames")
-    elif reuse_level == 'ascii':
-        print("  Still honored: font, colorized, black-masking, and "
-              "background options (rendering re-runs from reused text)")
-        print("  Note: character grid comes from the reused text files")
-    else:  # extracted
-        print("  Still honored: conversion and rendering options "
-              "(--ascii-width, --ramp, --hist-stretch, fonts, backgrounds)")
-
 # --------------------------------- Main --------------------------------------
 
 def cleanup_temp(temp_dir):
     shutil.rmtree(temp_dir, ignore_errors=True)
 
+# --------------------------- Programmatic entry ---------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Convert green-screen video to ASCII art video',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s input.mp4 output.mp4
-  %(prog)s input.mp4 out.mp4 --key-color 0x00FF00 --ascii-width 480
-  %(prog)s input.mp4 out.mp4 --no-key --leave-black-empty
-  %(prog)s input.mp4 out.mp4 --keep-temp
-  %(prog)s -i
-  %(prog)s input.mp4 out2.mp4 --reuse ascii --render-font-size 96
-  %(prog)s input.mp4 out3.mp4 --reuse final
-        """
-    )
+@dataclass
+class ConversionConfig:
+    """All knobs for one conversion run.
 
-    parser.add_argument('input', type=str, nargs='?',
-                        help='Input video file path')
-    parser.add_argument('output', type=str, nargs='?',
-                        help='Output ASCII video file path')
-    parser.add_argument('--key-color', type=str, default=None,
-                        help=f'Key color in hex format (default: {DEFAULT["KEY-COLOR"]}')
-    parser.add_argument('--detect-green', action='store_true',
-                        help='Force green color detection even if --key-color provided')
-    parser.add_argument('--tolerance', type=float, default=DEFAULT['TOLERANCE'],
-                        help=f'Chromakey tolerance (default: {DEFAULT["TOLERANCE"]})')
-    parser.add_argument('--edge-blending', type=float, default=DEFAULT["EDGE-BLEEDING"],
-                        help=f'Chromakey edge blending (default: {DEFAULT["EDGE-BLEEDING"]})')
-    parser.add_argument('--fps', type=float, default=None,
-                        help='Override output FPS (default: from input)')
-    parser.add_argument('--scale-divisor', type=int, default=DEFAULT['SCALE-DIVISOR'],
-                        help='Default ascii width = source width / this '
-                             f'when --ascii-width not given (default: {DEFAULT["SCALE-DIVISOR"]})')
-    parser.add_argument('--ascii-width', type=int, default=DEFAULT['ASCII-WIDTH'],
-                        help=f'ASCII grid width in characters (default: {DEFAULT["ASCII-WIDTH"]})')
-    parser.add_argument('--ramp', type=str, default=None,
-                        help="'jp2a' or a custom ramp string "
-                             "(default: full density ramp)")
-    parser.add_argument('--colorized', action='store_true',
-                        help='Render characters in their source colors '
-                             'instead of monochrome green')
-    parser.add_argument('--leave-black-empty', action='store_true',
-                        help='Leave black areas empty (no ASCII characters)')
-    parser.add_argument('--black-threshold', type=int, default=DEFAULT['BLACK-THRESHOLD'],
-                        help=f'Brightness threshold for "black" (default: {DEFAULT["BLACK-THRESHOLD"]})')
-    parser.add_argument('--hist-stretch', action='store_true',
-                        help='Global histogram stretch before character mapping')
-    parser.add_argument('--no-key', action='store_true',
-                        help='Skip chromakey stage entirely')
-    parser.add_argument('--sample-region', type=str, default=DEFAULT['SAMPLE-REGION'],
-                        help='Key color sampling region: corners, center, '
-                             f'full, or WxH+X+Y (default: {DEFAULT["SAMPLE-REGION"]})')
-    parser.add_argument('--render-font-size', type=int, default=DEFAULT['RASTERIZATION-QUALITY'],
-                        help=f'Font rasterization quality (default: {DEFAULT["RASTERIZATION-QUALITY"]})')
-    parser.add_argument('--target-resolution', type=str, default=None,
-                        help='Target WIDTHxHEIGHT, e.g. 1920x1080 '
-                             '(default: source dimensions)')
-    parser.add_argument('--jobs', type=int, default=None, metavar='N',
-                        help='Parallel worker processes (default: cores - 1)')
-    parser.add_argument('--keep-temp', action='store_true',
-                        help='Keep temporary files; record run in state file')
-    parser.add_argument('--silent-progress', action='store_true',
-                        help='Suppress progress bars')
-    parser.add_argument('--reuse', choices=['extracted', 'ascii', 'final'],
-                        default=None,
-                        help='Reuse artifacts: "extracted" skips keying+'
-                             'extraction, "ascii" also skips conversion, '
-                             '"final" reuses rendered frames entirely')
-    parser.add_argument('--reuse-dir', type=str, default=None, metavar='PATH',
-                        help='Explicit temp dir to reuse (default: last '
-                             '--keep-temp run, or $ASCII_VIDEO_TEMP)')
-    parser.add_argument('--report', action='store_true',
-                        help='Print recorded state of the last run and exit')
-    parser.add_argument('--state-file', action='store_true',
-                        help='Print the raw state JSON and exit')
-    parser.add_argument('--background-color', type=str, default=DEFAULT['BACKGROUND-COLOR'],
-                        help=f'Background color in CSS hex format (default: {DEFAULT["BACKGROUND-COLOR"]})')
-    parser.add_argument('--background-alpha', type=float, default=DEFAULT['BACKGROUND-ALPHA'],
-                        help=f'Background opacity 0-1 (0=transparent, 1=opaque; default: {DEFAULT["BACKGROUND-ALPHA"]})')
-    parser.add_argument('--vpx-preset', type=str, default=DEFAULT['VPX-PRESET'],
-                        choices=['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
-                        help=f'VP9 encoding speed for alpha output (default: {DEFAULT["VPX-PRESET"]})')
-    parser.add_argument('--font-color', type=str, default=None,
-                        help='Character color in CSS hex format '
-                             f'(default: {DEFAULT["FONT-COLOR"]}, the classic terminal green). '
-                             'Incompatible with --colorized')
+    Built by the CLI from parsed arguments, or directly for programmatic
+    use (tests, embedding). Values arrive pre-normalized: colors are RGB
+    tuples, alpha is clamped to [0, 1], target_resolution is (w, h).
+    """
+    input: Path
+    output: Path
 
-    args = parser.parse_args()
+    # --- keying ---
+    no_key: bool = False
+    key_color: Optional[str] = None          # None => auto-detect
+    detect_green: bool = False               # force detection despite key_color
+    tolerance: float = DEFAULT['TOLERANCE']
+    edge_blending: float = DEFAULT['EDGE-BLEEDING']
+    sample_region: str = DEFAULT['SAMPLE-REGION']
 
-    # ---- Standalone state modes ----
-    if args.report:
-        report_state(load_state())
-        sys.exit(0)
-    if args.state_file:
-        print(json.dumps(load_state(), indent=2))
-        sys.exit(0)
+    # --- grid / conversion ---
+    ascii_width: int = DEFAULT['ASCII-WIDTH']
+    ramp: Optional[str] = None               # None => DEFAULT['RAMP']
+    hist_stretch: bool = False
+    fps_override: Optional[float] = None     # None => use source fps
 
-    if not args.input or not args.output:
-        parser.error("input and output are required "
-                     "(unless using --report / --state-file)")
+    # --- rendering ---
+    render_font_size: int = DEFAULT['RASTERIZATION-QUALITY']
+    colorized: bool = False
+    font_color: Optional[str] = None         # raw string, for state records
+    font_color_rgb: Tuple[int, int, int] = _color_as_rgb(DEFAULT['FONT-COLOR'])
+    leave_black_empty: bool = False
+    black_threshold: int = DEFAULT['BLACK-THRESHOLD']
+    background_color: str = DEFAULT['BACKGROUND-COLOR']   # raw, for records
+    background_rgb: Tuple[int, int, int] = _color_as_rgb(DEFAULT['BACKGROUND-COLOR'])
+    background_alpha: float = DEFAULT['BACKGROUND-ALPHA']
+    target_resolution: Optional[Tuple[int, int]] = None
+    jobs: Optional[int] = None
+    vpx_preset: str = DEFAULT['VPX-PRESET']
 
-    input_path = Path(args.input)
-    output_path = Path(args.output)
+    # --- run control ---
+    keep_temp: bool = False
+    silent_progress: bool = False
+    reuse_level: Optional[str] = None        # extracted | ascii | final
+    reuse_dir: Optional[Path] = None         # resolved by the caller (CLI)
 
-    if not input_path.exists():
-        print(f"Error: Input file '{args.input}' not found")
-        sys.exit(1)
-    if input_path.suffix.lower() not in ['.mp4', '.mov', '.avi', '.mkv',
-                                          '.webm']:
-        print("Warning: Uncommon video format detected. May fail.")
 
+def run_conversion(cfg: ConversionConfig) -> Path:
+    """Execute the full pipeline described by cfg.
+
+    Pure-execution counterpart to the CLI: no argument parsing and no
+    option validation (the caller guarantees normalized values). Raises
+    on failure after cleaning up this run's temp directory (unless
+    cfg.keep_temp). Returns the output path.
+    """
     global TQDM_DISABLED
-    TQDM_DISABLED = args.silent_progress
+    TQDM_DISABLED = cfg.silent_progress
 
-    # Parse background color
-    try:
-        bg_color_rgb = _color_as_rgb(args.background_color.lstrip('#'))
-    except (ValueError, IndexError):
-        print(f"Error: Invalid background color '{args.background_color}'. "
-              f"Use CSS hex format (e.g., #RRGGBB)")
-        sys.exit(1)
+    input_path, output_path = cfg.input, cfg.output
+    reuse_level, reuse_dir = cfg.reuse_level, cfg.reuse_dir
 
-    bg_alpha = max(0.0, min(1.0, args.background_alpha))
-
-        # Resolve output container: alpha requires WebM
-    if bg_alpha < 1.0:
-        if output_path.suffix.lower() != '.webm':
-            original_name = str(output_path)
-            output_path = output_path.with_suffix('.webm')
-            print("! " + "-"*58 + " !")
-            print(f"! {'NOTE: alpha output requires WebM'.center(56)} !")
-            print("! " + "-"*58 + " !")
-            print(f"!  Output filename changed:")
-            print(f"!    {original_name}")
-            print(f"!    -> {output_path}")
-            print("! " + "-"*58 + " !")
-            print(f"!  Reason: --background-alpha {bg_alpha:g} produces a")
-            print(f"!  transparent video, which requires the VP9/WebM")
-            print(f"!  container. Use --background-alpha 1 to force MP4.")
-            print("! " + "-"*58 + " !\n")
-            if output_path.exists():
-                alt = output_path.with_name(
-                    output_path.stem + '_new' + output_path.suffix)
-                print(f"!  WARNING: {output_path} already exists;")
-                print(f"!  writing to {alt} instead\n")
-                output_path = alt
-
-    if args.font_color and args.colorized:
-        print("Error: --font-color and --colorized are mutually exclusive.")
-        print("       --colorized samples each character's color from the "
-                              "source frame,")
-        print("       leaving no role for a uniform --font-color.")
-        sys.exit(1)
-
-    try:
-        font_color_rgb = _color_as_rgb(args.font_color or DEFAULT['FONT-COLOR'])
-    except (ValueError, IndexError):
-        print(f"Error: Invalid font color '{args.font_color}'. "
-              f"Use CSS hex format (e.g., #64FF64)")
-        sys.exit(1)
-
-    # ---- Resolve reuse ----
     state = load_state()
-    reuse_level = args.reuse
-    reuse_dir = None
-    if reuse_level:
-        reuse_dir = resolve_reuse_dir(args.reuse_dir, state)
-        if reuse_dir is None:
-            print("Error: no reusable temp directory found. Run once with "
-                  "--keep-temp first, or set ASCII_VIDEO_TEMP / --reuse-dir.")
-            sys.exit(1)
-        validate_reuse(reuse_dir, reuse_level)
-        frames_dir = reuse_dir / 'frames'
-        txt_dir_r = reuse_dir / 'txt_frames'
-        img_dir_r = reuse_dir / 'images'
-        print(f"  Reusing artifacts from: {reuse_dir}")
-        print(f"  Level: {reuse_level}  (frames={count_dir(frames_dir)}, "
-              f"ascii={count_dir(txt_dir_r)}, rendered={count_dir(img_dir_r)})")
-        report_reuse_semantics(reuse_level)
-
     run_start = time.time()
     temp_dir = Path(tempfile.mkdtemp(prefix='asciify_'))
 
-    # Begin run-state recording
-    state = load_state()
     state.update({
-        'input': str(input_path), 'keep_temp': args.keep_temp,
+        'input': str(input_path), 'keep_temp': cfg.keep_temp,
         'completed': False, 'stages_completed': [], 'counts': {},
         'temp_dir': None, 'output': None, 'duration_s': None,
     })
@@ -1021,13 +869,13 @@ Examples:
             print(f"  Resolution: {width}x{height}")
             print(f"  Frame rate: {fps:.2f} fps")
             print(f"  Audio: {'Yes' if has_audio else 'No'}")
-        fps = args.fps if args.fps else fps
+        fps = cfg.fps_override if cfg.fps_override else fps
 
         # Resolve ramp
-        if args.ramp == 'jp2a':
+        if cfg.ramp == 'jp2a':
             ramp = JP2A_RAMP
-        elif args.ramp:
-            ramp = args.ramp
+        elif cfg.ramp:
+            ramp = cfg.ramp
         else:
             ramp = DEFAULT['RAMP']
 
@@ -1042,19 +890,19 @@ Examples:
         if reuse_level:
             print(f"  Skipped (reuse: {reuse_level})")
             key_color, was_detected = 'N/A (reused)', False
-        elif args.no_key:
+        elif cfg.no_key:
             print("  Skipping key color detection (--no-key)")
             key_color, was_detected = 'N/A', False
-        elif args.detect_green or args.key_color is None:
+        elif cfg.detect_green or cfg.key_color is None:
             key_color, was_detected = sample_green_color(
-                input_path, region=args.sample_region,
+                input_path, region=cfg.sample_region,
                 src_width=width, src_height=height)
         else:
-            key_color, was_detected = args.key_color, False
+            key_color, was_detected = cfg.key_color, False
 
         if reuse_level:
             key_mode = 'none'
-        elif args.no_key:
+        elif cfg.no_key:
             key_mode = 'none'
         elif was_detected:
             key_mode = 'auto'
@@ -1063,8 +911,8 @@ Examples:
         state['key'] = {'mode': key_mode,
                         'color': None if key_color.startswith('N/A') else key_color,
                         'detected': was_detected,
-                        'tolerance': args.tolerance,
-                        'edge_blending': args.edge_blending}
+                        'tolerance': cfg.tolerance,
+                        'edge_blending': cfg.edge_blending}
         state['stages_completed'] += ['key']
         save_state(state)
         if not reuse_level:
@@ -1075,7 +923,7 @@ Examples:
         # ---- Stage 3: Chromakey ----
         if reuse_level:
             print(f"[3/6] Skipping chromakey/extraction (reuse: {reuse_level})")
-        elif args.no_key:
+        elif cfg.no_key:
             print("[3/6] Skipping chromakey (--no-key)")
             chroma_output = input_path
         else:
@@ -1084,7 +932,7 @@ Examples:
             with tqdm(total=1, desc="  Processing video",
                       disable=TQDM_DISABLED) as pbar:
                 chromakey_to_black(input_path, chroma_output, key_color,
-                                   args.tolerance, args.edge_blending,
+                                   cfg.tolerance, cfg.edge_blending,
                                    width, height, fps)
                 pbar.update(1)
             print(f"  Output: {chroma_output}")
@@ -1098,11 +946,11 @@ Examples:
             print(f"  {len(frames)} frames")
         else:
             print("[4/6] Extracting frames...")
-            print(f"  Extracting at {args.ascii_width}px wide "
+            print(f"  Extracting at {cfg.ascii_width}px wide "
                   f"for 1:1 character mapping")
             frames_dir = temp_dir / 'frames'
             frames = extract_frames(chroma_output, frames_dir, fps,
-                                    args.ascii_width)
+                                    cfg.ascii_width)
         state['counts']['frames'] = len(frames)
         state['stages_completed'] += ['extract']
         save_state(state)
@@ -1112,8 +960,8 @@ Examples:
             raise RuntimeError("No frames extracted/found — cannot continue")
 
         # ---- Target resolution & grid metrics ----
-        if args.target_resolution:
-            tw, th = map(int, args.target_resolution.split('x'))
+        if cfg.target_resolution:
+            tw, th = cfg.target_resolution
         else:
             tw, th = width, height
 
@@ -1131,14 +979,13 @@ Examples:
                   "(fused, parallel)...")
 
             stretch = None
-            if args.hist_stretch and reuse_level != 'ascii':
+            if cfg.hist_stretch and reuse_level != 'ascii':
                 print("  Computing global histogram bounds...")
                 stretch = compute_global_stretch(frames)
                 print(f"  Stretch range: {stretch[0]}-{stretch[1]} "
                       f"(gain x{255 / max(stretch[1] - stretch[0], 1):.2f})")
             elif reuse_level == 'ascii':
-                # stretch applied at conversion time originally; warn
-                if args.hist_stretch:
+                if cfg.hist_stretch:
                     print("  Note: --hist-stretch affects conversion; "
                           "ignored when reusing ascii text")
 
@@ -1151,14 +998,13 @@ Examples:
                     raise RuntimeError(
                         f"ascii/frame count mismatch: "
                         f"{len(ascii_files)} txt vs {len(frames)} frames")
-                # Grid comes from the reused files, not the current flags
                 with open(ascii_files[0]) as f:
                     first = f.read().rstrip('\n').split('\n')
                 max_cols = max(len(l) for l in first)
                 max_rows = len(first)
-                if args.ascii_width != max_cols:
+                if cfg.ascii_width != max_cols:
                     print(f"  Note: reused ASCII grid is {max_cols} cols; "
-                          f"--ascii-width={args.ascii_width} ignored")
+                          f"--ascii-width={cfg.ascii_width} ignored")
                 print(f"  Using {len(ascii_files)} reused ASCII files "
                       f"(grid {max_cols}x{max_rows})")
 
@@ -1167,38 +1013,40 @@ Examples:
                 off_x = (tw - cell_w * max_cols) // 2
                 off_y = (th - cell_h * max_rows) // 2
                 metrics = (max_cols, max_rows, cell_w, cell_h,
-                           off_x, off_y, tw, th, args.render_font_size)
+                           off_x, off_y, tw, th, cfg.render_font_size)
 
                 rendered_images = frames_to_rendered_images(
                     frames, img_dir, metrics, ramp, None,
-                    leave_black_empty=args.leave_black_empty,
-                    black_threshold=args.black_threshold,
-                    jobs=args.jobs, ascii_files=ascii_files,
-                    colorized=args.colorized,
-                    bg_color_rgb=bg_color_rgb,
-                    bg_alpha=bg_alpha, font_color_rgb=font_color_rgb)
+                    leave_black_empty=cfg.leave_black_empty,
+                    black_threshold=cfg.black_threshold,
+                    jobs=cfg.jobs, ascii_files=ascii_files,
+                    colorized=cfg.colorized,
+                    bg_color_rgb=cfg.background_rgb,
+                    bg_alpha=cfg.background_alpha,
+                    font_color_rgb=cfg.font_color_rgb)
             else:
                 # Fresh (or reuse 'extracted'): grid is analytic
                 from PIL import Image
                 _, fh = Image.open(frames[0]).size
-                max_cols = args.ascii_width
+                max_cols = cfg.ascii_width
                 max_rows = max(1, fh // 2)
                 cell_w = max(1, tw // max_cols)
                 cell_h = max(1, th // max_rows)
                 off_x = (tw - cell_w * max_cols) // 2
                 off_y = (th - cell_h * max_rows) // 2
                 metrics = (max_cols, max_rows, cell_w, cell_h,
-                           off_x, off_y, tw, th, args.render_font_size)
+                           off_x, off_y, tw, th, cfg.render_font_size)
 
                 rendered_images = frames_to_rendered_images(
                     frames, img_dir, metrics, ramp, stretch,
-                    leave_black_empty=args.leave_black_empty,
-                    black_threshold=args.black_threshold,
-                    jobs=args.jobs,
-                    txt_dir=(temp_dir / 'txt_frames') if args.keep_temp else None,
-                    colorized=args.colorized,
-                    bg_color_rgb=bg_color_rgb,
-                    bg_alpha=bg_alpha, font_color_rgb=font_color_rgb)
+                    leave_black_empty=cfg.leave_black_empty,
+                    black_threshold=cfg.black_threshold,
+                    jobs=cfg.jobs,
+                    txt_dir=(temp_dir / 'txt_frames') if cfg.keep_temp else None,
+                    colorized=cfg.colorized,
+                    bg_color_rgb=cfg.background_rgb,
+                    bg_alpha=cfg.background_alpha,
+                    font_color_rgb=cfg.font_color_rgb)
 
         state['grid'] = {
             'ascii_width': max_cols, 'rows': max_rows,
@@ -1208,17 +1056,17 @@ Examples:
         }
         state['render'] = {
             'target_width': tw, 'target_height': th,
-            'font_size': args.render_font_size,
-            'font_color': args.font_color,
-            'colorized': args.colorized,
-            'leave_black_empty': args.leave_black_empty,
-            'black_threshold': args.black_threshold,
-            'bg_color': args.background_color,
-            'bg_alpha': bg_alpha,
+            'font_size': cfg.render_font_size,
+            'font_color': cfg.font_color,
+            'colorized': cfg.colorized,
+            'leave_black_empty': cfg.leave_black_empty,
+            'black_threshold': cfg.black_threshold,
+            'bg_color': cfg.background_color,
+            'bg_alpha': cfg.background_alpha,
         }
-        state['counts']['ascii_files'] = (count_dir(reuse_dir / 'txt_frames')
-                                          if reuse_level in ('ascii',)
-                                          else state['counts']['frames'])
+        state['counts']['ascii_files'] = (
+            count_dir(reuse_dir / 'txt_frames')
+            if reuse_level in ('ascii',) else state['counts']['frames'])
         state['counts']['rendered_images'] = len(rendered_images)
         state['stages_completed'] += ['ascii', 'render']
         save_state(state)
@@ -1227,16 +1075,15 @@ Examples:
 
         # ---- Stage 7: Assemble ----
         print("[7/6] Assembling final video...")
-        # ---- Stage 7: Assemble ----
         if reuse_level == 'final':
             # Resolution may differ from the run that created these frames
             validate_reuse_frame_sizes(reuse_dir, state, tw, th)
 
-        # Normal run (or non-final reuse): frames were just rendered at target
         assemble_video(rendered_images, output_path, fps, input_path,
-                       has_audio, tw, th, check_frames=(reuse_level == 'final'),
-                       bg_alpha=bg_alpha,
-                       vpx_preset=args.vpx_preset)
+                       has_audio, tw, th,
+                       check_frames=(reuse_level == 'final'),
+                       bg_alpha=cfg.background_alpha,
+                       vpx_preset=cfg.vpx_preset)
         print(f"  Final output: {output_path}")
         print()
 
@@ -1247,7 +1094,7 @@ Examples:
         state['completed'] = True
         state['duration_s'] = round(time.time() - run_start, 1)
         state['stages_completed'] += ['assemble']
-        if args.keep_temp:
+        if cfg.keep_temp:
             state['temp_dir'] = str(temp_dir)
             print(f"\n  Temp directory (kept): {temp_dir}")
             print(f"  State file: {STATE_FILE}")
@@ -1255,25 +1102,24 @@ Examples:
             state['temp_dir'] = None
         save_state(state)
         print()
+        return output_path
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")
-        if not args.keep_temp:
-            cleanup_temp(temp_dir)
         save_state(state)
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        if not args.keep_temp:
+        raise
+    except Exception:
+        if not cfg.keep_temp:
             print("Cleaning up temporary files...")
-            cleanup_temp(temp_dir)
         save_state(state)
-        sys.exit(1)
+        raise
     finally:
         # Never clean a reused directory; only this run's own temp dir
-        if not args.keep_temp:
+        if not cfg.keep_temp:
             cleanup_temp(temp_dir)
 
 
 if __name__ == '__main__':
-    main()
+    # Backward-compatible entry: delegate to the CLI module.
+    from asciify_cli import main as cli_main
+    sys.exit(cli_main())

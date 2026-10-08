@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-Unit tests for asciify.py — regression suite for refactoring.
+Unit tests for asciify.py + asciify_cli.py — regression suite for the
+CLI/core refactoring.
 
-Strategy:
+Layout after the split:
+  - asciify.py     : core library (probe, key, extract, convert, render,
+                     assemble, state, reuse helpers, run_conversion +
+                     ConversionConfig). No argparse, no CLI logic.
+  - asciify_cli.py : command-line front end (parsing, validation,
+                     normalization, WebM rename rule, reuse resolution,
+                     dead-flag warnings, exit codes).
+
+Testing strategy:
   - ffmpeg/ffprobe invocations are intercepted by mocking asciify.run_command
     (and asciify.subprocess.run where the code calls it directly), so no
     binaries are needed and every command is asserted.
@@ -10,6 +19,9 @@ Strategy:
     exercised for real using tiny PIL-generated images.
   - Reuse/artifact validation runs against synthetic artifact directories
     laid out exactly like a --keep-temp run.
+  - CLI-layer tests invoke asciify_cli.main(argv) directly (no sys.argv
+    spoofing); preflight interception still works because run_conversion
+    lives in the asciify module namespace.
 
 Optionally, point ASCIIFY_TEST_ARTIFACTS at a real temp dir from a
 --keep-temp run to also run the real-artifact integration tests:
@@ -19,6 +31,7 @@ Optionally, point ASCIIFY_TEST_ARTIFACTS at a real temp dir from a
     pytest test_asciify.py -v
 """
 
+import ast
 import json
 import os
 import shutil
@@ -31,6 +44,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 import asciify
+import asciify_cli
 
 # --------------------------------------------------------------------------
 # Optional real artifacts from a --keep-temp run
@@ -44,7 +58,7 @@ needs_real_frames = pytest.mark.skipif(
     not REAL_FRAMES, reason="set ASCIIFY_TEST_ARTIFACTS to a --keep-temp dir")
 
 # --------------------------------------------------------------------------
-# Regression Cannary Tests
+# Regression Canary Tests (architecture guards)
 # --------------------------------------------------------------------------
 
 class TestNoDeprecatedPillowUsage:
@@ -56,8 +70,6 @@ class TestNoDeprecatedPillowUsage:
         can never trigger it. Use _flattened_pixels() or
         Image.tobytes() instead.
         """
-        import ast
-
         source = Path(asciify.__file__).read_text(encoding='utf-8')
         tree = ast.parse(source)   # syntax errors surface as test errors,
                                    # never silent passes
@@ -70,6 +82,69 @@ class TestNoDeprecatedPillowUsage:
             f'getdata() is deprecated (Pillow 14 removal); '
             f'found attribute access at {offenders}; '
             f'use _flattened_pixels() or Image.tobytes() instead')
+
+class TestCliCoreSeparation:
+    """The refactor's central contract: no CLI machinery in the core,
+    no video processing logic in the CLI."""
+
+    def test_core_module_has_no_argparse_import(self):
+        """argparse belongs exclusively to the CLI layer."""
+        source = Path(asciify.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(alias.name != 'argparse'
+                           for alias in node.names), \
+                    'core module imports argparse; move it to asciify_cli'
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module != 'argparse', \
+                    'core module imports argparse; move it to asciify_cli'
+
+    def test_core_module_defines_no_main(self):
+        """Programmatic entry is run_conversion(); main() lives in the
+        CLI. (The __main__ delegate block is allowed.)"""
+        source = Path(asciify.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        offenders = [f'line {node.lineno}' for node in ast.walk(tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and node.name == 'main'
+                     and getattr(node, 'parent', None) is None]
+        assert not offenders, \
+            f'asciify.py defines main() at {offenders}; the CLI entry ' \
+            f'point belongs in asciify_cli.py'
+
+    def test_core_entry_points_exist(self):
+        assert callable(asciify.run_conversion)
+        assert hasattr(asciify, 'ConversionConfig')
+        # state / reuse helpers remain core-owned
+        for name in ('load_state', 'save_state', 'report_state',
+                     'resolve_reuse_dir', 'validate_reuse',
+                     'probe_video', 'chromakey_to_black',
+                     'extract_frames', 'assemble_video'):
+            assert callable(getattr(asciify, name)), name
+
+    def test_cli_entry_point_exists(self):
+        assert callable(asciify_cli.main)
+        assert callable(asciify_cli.build_parser)
+        assert callable(asciify_cli.build_config)
+
+    def test_cli_parser_roundtrips_all_options(self):
+        """Every flag parses; spot-check a few values survive intact."""
+        parser = asciify_cli.build_parser()
+        args = parser.parse_args([
+            'in.mp4', 'out.mp4', '--key-color', '0x00B140',
+            '--ascii-width', '480', '--no-key', '--leave-black-empty',
+            '--background-alpha', '0.5', '--font-color', '#FF0000',
+            '--reuse', 'final', '--jobs', '4', '--vpx-preset', 'slow'])
+        assert args.input == 'in.mp4' and args.output == 'out.mp4'
+        assert args.key_color == '0x00B140'
+        assert args.ascii_width == 480
+        assert args.no_key and args.leave_black_empty
+        assert args.background_alpha == 0.5
+        assert args.font_color == '#FF0000'
+        assert args.reuse == 'final'
+        assert args.jobs == 4
+        assert args.vpx_preset == 'slow'
 
 # --------------------------------------------------------------------------
 # Helpers / fixtures
@@ -100,7 +175,7 @@ def cell_png(path, values, cols=None, rows=None):
     return path
 
 def build_metrics(max_cols, max_rows, tw, th, font_size=32):
-    """Replicate the analytic grid math from main()."""
+    """Replicate the analytic grid math from run_conversion()."""
     cell_w = max(1, tw // max_cols)
     cell_h = max(1, th // max_rows)
     off_x = (tw - cell_w * max_cols) // 2
@@ -160,31 +235,41 @@ def ffprobe_stdout(width=1920, height=1080, rate='30/1', audio=True):
         streams.append({'codec_type': 'audio'})
     return json.dumps({'streams': streams})
 
+def invoke_main(argv):
+    """Run the CLI main() and normalize exit semantics.
+
+    Handles both return codes (pipeline errors surface as return 1)
+    and argparse's SystemExit (bad usage / sys.exit in validators).
+    """
+    try:
+        return asciify_cli.main(argv)
+    except SystemExit as e:
+        return e.code
+
 def call_main(monkeypatch, tmp_path, argv, state_exists=False,
               state_body=None):
-    """Invoke main() with sys.argv spoofed, cwd and state file contained
-    to tmp_path. probe_video is replaced with an exception so the run
-    halts right after the pre-flight checks we want to observe.
+    """Invoke the CLI with a controllable argv, cwd and state file
+    contained to tmp_path. probe_video is replaced with an exception so
+    the run halts right after the pre-flight checks we want to observe.
 
-    NB: main() resolves relative input/output paths against the cwd,
-    so we chdir into tmp_path first.
-    Returns the exit code (or None if main() returned normally).
+    The input file named in argv is created as an empty stub so
+    preflight existence checks pass regardless of its extension.
+    Interception works even though main() lives in asciify_cli because
+    run_conversion() resides in the asciify module namespace.
+    Returns the exit code (return value or SystemExit code).
     """
-    (tmp_path / 'in.mp4').write_bytes(b'')
+    parsed = asciify_cli.build_parser().parse_args(argv)
+    if parsed.input:
+        (tmp_path / parsed.input).write_bytes(b'')
     monkeypatch.chdir(tmp_path)
     state_file = isolated_state(monkeypatch, tmp_path)
     if state_exists:
         state_file.write_text(json.dumps(state_body or {}))
-    monkeypatch.setattr(sys, 'argv', ['asciify.py'] + argv)
     monkeypatch.setattr(
         asciify, 'probe_video',
         MagicMock(side_effect=RuntimeError('HALT_AFTER_PREFLIGHT')))
-    code = None
-    try:
-        asciify.main()
-    except SystemExit as e:
-        code = e.code
-    return code
+    return invoke_main(argv)
+
 
 # ==========================================================================
 # 1. Video probing (ffprobe faked)
@@ -590,7 +675,7 @@ class TestFramesToRenderedImages:
             expected_char(128) + expected_char(64))
 
 # ==========================================================================
-# 5. State file handling
+# 5. State file handling (core-owned)
 # ==========================================================================
 
 class TestStateFile:
@@ -678,7 +763,7 @@ class TestReportState:
         assert '(--no-key)' in capsys.readouterr().out
 
 # ==========================================================================
-# 6. Reuse machinery
+# 6. Reuse machinery (core helpers)
 # ==========================================================================
 
 class TestReuseHelpers:
@@ -736,21 +821,28 @@ class TestReuseHelpers:
         assert 'Warning' not in capsys.readouterr().out
 
 class TestReuseSemanticsReporting:
-    def test_dead_flag_warning(self, monkeypatch, capsys):
-        monkeypatch.setattr(sys, 'argv', [
-            'asciify.py', 'in.mp4', 'out.mp4', '--reuse', 'final',
-            '--font-color', '#FF0000'])
-        asciify.report_reuse_semantics('final')
+    """Dead-flag reporting lives in the CLI layer now — it inspects raw
+    argv, which is inherently a command-line concern."""
+
+    def test_dead_flag_warning(self, capsys):
+        asciify_cli.report_reuse_semantics_cli(
+            'final', ['in.mp4', 'out.mp4',
+                      '--font-color', '#FF0000'])
         out = capsys.readouterr().out
         assert '!! --font-color was passed but is IGNORED (--reuse final)'\
             in out
         assert 'Still honored: --fps' in out
 
-    def test_no_warning_when_flag_not_passed(self, monkeypatch, capsys):
-        monkeypatch.setattr(sys, 'argv',
-                            ['asciify.py', 'in.mp4', 'out.mp4'])
-        asciify.report_reuse_semantics('ascii')
+    def test_no_warning_when_flag_not_passed(self, capsys):
+        asciify_cli.report_reuse_semantics_cli(
+            'ascii', ['in.mp4', 'out.mp4'])
         assert '!!' not in capsys.readouterr().out
+
+    def test_equal_sign_form_recognized(self, capsys):
+        # --font-color=#FF0000 must count as passing --font-color
+        asciify_cli.report_reuse_semantics_cli(
+            'final', ['in.mp4', '--font-color=#FF0000'])
+        assert 'IGNORED' in capsys.readouterr().out
 
     def test_flag_map_registrations_complete(self):
         # Rendering flags must all be registered, per README checklist
@@ -775,41 +867,108 @@ class TestReuseSemanticsReporting:
         assert asciify.frame_num(Path('no_digits.png')) == 0
 
 # ==========================================================================
-# 7. main() pre-flight behavior (subprocess-free paths only)
+# 7. Programmatic entry point (core): ConversionConfig + run_conversion
+# ==========================================================================
+
+class TestConversionConfig:
+    def test_defaults_match_constants(self):
+        cfg = asciify.ConversionConfig(input=Path('a.mp4'),
+                                       output=Path('b.mp4'))
+        assert cfg.no_key is False
+        assert cfg.key_color is None
+        assert cfg.tolerance == asciify.DEFAULT['TOLERANCE']
+        assert cfg.ascii_width == asciify.DEFAULT['ASCII-WIDTH']
+        assert cfg.background_alpha == 1.0
+        assert cfg.font_color_rgb == (0x64, 0xFF, 0x64)
+        assert cfg.background_rgb == (0, 0, 0)
+        assert cfg.reuse_level is None and cfg.reuse_dir is None
+        assert cfg.target_resolution is None
+        assert cfg.vpx_preset == 'ultrafast'
+
+    def test_build_config_translates_args(self, monkeypatch, tmp_path):
+        """CLI translation layer produces a fully normalized config."""
+        parser = asciify_cli.build_parser()
+        args = parser.parse_args([
+            'in.mp4', 'out.mp4', '--background-color', '#102030',
+            '--background-alpha', '0.5', '--font-color', '#AABBCC'])
+        cfg = asciify_cli.build_config(args, Path('in.mp4'),
+                                        Path('out.mp4'))
+        assert cfg.background_rgb == (0x10, 0x20, 0x30)
+        assert cfg.background_alpha == 0.5
+        assert cfg.font_color_rgb == (0xAA, 0xBB, 0xCC)
+        # WebM rename rule applied inside build_config
+        assert cfg.output.name == 'out.webm'
+
+    def test_target_resolution_parsed(self, monkeypatch, tmp_path):
+        parser = asciify_cli.build_parser()
+        args = parser.parse_args(
+            ['in.mp4', 'out.mp4', '--target-resolution', '1280x720'])
+        cfg = asciify_cli.build_config(args, Path('in.mp4'),
+                                       Path('out.mp4'))
+        assert cfg.target_resolution == (1280, 720)
+
+class TestRunConversion:
+    def test_raises_instead_of_exiting(self, monkeypatch, tmp_path):
+        """Core is library-grade: failures propagate as exceptions, and
+        the CLI is responsible for converting them to exit codes."""
+        isolated_state(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            asciify, 'probe_video',
+            MagicMock(side_effect=RuntimeError('HALT_AFTER_PREFLIGHT')))
+        cfg = asciify.ConversionConfig(input=tmp_path / 'in.mp4',
+                                       output=tmp_path / 'out.mp4')
+        with pytest.raises(RuntimeError, match='HALT_AFTER_PREFLIGHT'):
+            asciify.run_conversion(cfg)
+
+    def test_cleanup_on_failure_without_keep_temp(self, monkeypatch,
+                                                  tmp_path):
+        """A failing run must not leak its temp dir (unless keep_temp)."""
+        isolated_state(monkeypatch, tmp_path)
+        real_mkdtemp = asciify.tempfile.mkdtemp
+
+        seen = []
+
+        def tracking_mkdtemp(*a, **kw):
+            d = real_mkdtemp(*a, **kw)
+            seen.append(d)
+            return d
+        monkeypatch.setattr(asciify.tempfile, 'mkdtemp', tracking_mkdtemp)
+        monkeypatch.setattr(
+            asciify, 'probe_video',
+            MagicMock(side_effect=RuntimeError('boom')))
+        cfg = asciify.ConversionConfig(input=tmp_path / 'in.mp4',
+                                       output=tmp_path / 'out.mp4')
+        with pytest.raises(RuntimeError, match='boom'):
+            asciify.run_conversion(cfg)
+        for d in seen:
+            assert not Path(d).is_dir()
+
+# ==========================================================================
+# 8. CLI pre-flight behavior
 # ==========================================================================
 
 class TestMainPreflight:
-    def test_report_mode_exits_cleanly(self, monkeypatch, tmp_path, capsys):
+    def test_report_mode_succeeds(self, monkeypatch, tmp_path, capsys):
         sf = isolated_state(monkeypatch, tmp_path)
         sf.write_text(json.dumps({'input': 'in.mp4', 'completed': True}))
-        monkeypatch.setattr(sys, 'argv', ['asciify.py', '--report'])
-        with pytest.raises(SystemExit) as e:
-            asciify.main()
-        assert e.value.code == 0
+        assert invoke_main(['--report']) == 0
         assert 'in.mp4' in capsys.readouterr().out
 
     def test_state_file_mode_dumps_json(self, monkeypatch, tmp_path, capsys):
         isolated_state(monkeypatch, tmp_path)
-        monkeypatch.setattr(sys, 'argv', ['asciify.py', '--state-file'])
-        with pytest.raises(SystemExit) as e:
-            asciify.main()
-        assert e.value.code == 0
+        assert invoke_main(['--state-file']) == 0
         assert json.loads(capsys.readouterr().out)['version'] == 1
 
     def test_missing_input_file(self, monkeypatch, tmp_path, capsys):
         isolated_state(monkeypatch, tmp_path)
-        monkeypatch.setattr(sys, 'argv',
-                            ['asciify.py', '/no/such/file.mp4', 'o.mp4'])
-        with pytest.raises(SystemExit) as e:
-            asciify.main()
-        assert e.value.code == 1
+        assert invoke_main(['/no/such/file.mp4', 'o.mp4']) == 1
         assert 'not found' in capsys.readouterr().out
 
     def test_missing_positional_args(self, monkeypatch, tmp_path):
         isolated_state(monkeypatch, tmp_path)
-        monkeypatch.setattr(sys, 'argv', ['asciify.py'])
+        # argparse's parser.error() exits with code 2
         with pytest.raises(SystemExit):
-            asciify.main()
+            asciify_cli.main([])
 
     def test_invalid_background_color(self, monkeypatch, tmp_path, capsys):
         code = call_main(monkeypatch, tmp_path,
@@ -833,17 +992,31 @@ class TestMainPreflight:
         assert code == 1  # halted at probe, i.e. NOT at color validation
         assert 'Invalid font color' not in capsys.readouterr().out
 
+    def test_invalid_target_resolution(self, monkeypatch, tmp_path, capsys):
+        code = call_main(monkeypatch, tmp_path,
+                         ['in.mp4', 'out.mp4',
+                          '--target-resolution', 'garbage'])
+        assert code == 1
+        assert 'Invalid target resolution' in capsys.readouterr().out
+
+    def test_uncommon_extension_warns_but_continues(self, monkeypatch,
+                                                    tmp_path, capsys):
+        code = call_main(monkeypatch, tmp_path,
+                         ['in.dat', 'out.mp4'])
+        assert code == 1  # past the warning, halted at probe
+        out = capsys.readouterr().out
+        assert 'Uncommon video format' in out
+
     def test_reuse_without_temp_dir_errors(self, monkeypatch, tmp_path,
                                             capsys):
         isolated_state(monkeypatch, tmp_path)   # no temp_dir recorded
-        monkeypatch.setattr(sys, 'argv',
-                            ['asciify.py', 'in.mp4', 'out.mp4',
-                             '--reuse', 'ascii'])
         (tmp_path / 'in.mp4').write_bytes(b'')
         monkeypatch.chdir(tmp_path)
-        with pytest.raises(SystemExit) as e:
-            asciify.main()
-        assert e.value.code == 1
+        monkeypatch.setattr(
+            asciify, 'probe_video',
+            MagicMock(side_effect=RuntimeError('should not reach probe')))
+        code = invoke_main(['in.mp4', 'out.mp4', '--reuse', 'ascii'])
+        assert code == 1
         assert 'no reusable temp directory' in capsys.readouterr().out
 
 class TestWebMRenameBehavior:
@@ -891,7 +1064,6 @@ class TestFontColorColorizedConflict:
         assert code == 1
         assert 'mutually exclusive' in capsys.readouterr().out
 
-
     def test_colorized_quickstart_contract(self, monkeypatch, tmp_path,
                                            capsys):
         """README promises `--colorized` works standalone. This holds
@@ -902,8 +1074,19 @@ class TestFontColorColorizedConflict:
         assert code == 1  # halted at probe (the mocked HALT)
         assert 'mutually exclusive' not in capsys.readouterr().out
 
+class TestCliErrorHandling:
+    def test_pipeline_exception_maps_to_exit_1(self, monkeypatch, tmp_path,
+                                               capsys):
+        """Exception contract between layers: run_conversion raises,
+        the CLI prints ERROR and returns 1."""
+        code = call_main(monkeypatch, tmp_path,
+                         ['in.mp4', 'out.mp4'])
+        assert code == 1
+        out = capsys.readouterr().out
+        assert 'ERROR: HALT_AFTER_PREFLIGHT' in out
+
 # ==========================================================================
-# 8. Optional integration with real --keep-temp artifacts
+# 9. Optional integration with real --keep-temp artifacts
 # ==========================================================================
 
 @needs_real_frames
