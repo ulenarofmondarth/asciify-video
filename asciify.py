@@ -862,7 +862,7 @@ Examples:
     parser.add_argument('--vpx-preset', type=str, default='ultrafast',
                         choices=['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
                         help='VP9 encoding speed for alpha output (default: ultrafast)')
-    parser.add_argument('--font-color', type=str, default='#64FF64',
+    parser.add_argument('--font-color', type=str, default=None,
                         help='Character color in CSS hex format '
                              '(default: #64FF64, the classic terminal green). '
                              'Incompatible with --colorized')
@@ -939,17 +939,20 @@ Examples:
         print("       leaving no role for a uniform --font-color.")
         sys.exit(1)
 
-    fc_hex = args.font_color.lstrip('#')
-    try:
-        font_color_rgb = (
-            int(fc_hex[0:2], 16),
-            int(fc_hex[2:4], 16),
-            int(fc_hex[4:6], 16),
-        )
-    except (ValueError, IndexError):
-        print(f"Error: Invalid font color '{args.font_color}'. "
-              f"Use CSS hex format (e.g., #64FF64)")
-        sys.exit(1)
+    if args.font_color:
+        fc_hex = args.font_color.lstrip('#')
+        try:
+            font_color_rgb = (
+                int(fc_hex[0:2], 16),
+                int(fc_hex[2:4], 16),
+                int(fc_hex[4:6], 16),
+            )
+        except (ValueError, IndexError):
+            print(f"Error: Invalid font color '{args.font_color}'. "
+                  f"Use CSS hex format (e.g., #64FF64)")
+            sys.exit(1)
+    else:
+        font_color_rgb = (100, 255, 100)
 
     # ---- Resolve reuse ----
     state = load_state()

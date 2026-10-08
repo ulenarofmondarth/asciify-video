@@ -891,24 +891,7 @@ class TestFontColorColorizedConflict:
         assert code == 1
         assert 'mutually exclusive' in capsys.readouterr().out
 
-    def test_colorized_alone_currently_aborts___known_bug(
-            self, monkeypatch, tmp_path, capsys):
-        """Pins the CURRENT (buggy) behavior: --colorized alone also
-        aborts, because --font-color defaults to a truthy '#64FF64'.
-        If this test fails after a fix, delete it and rely on the
-        contract test below (which will XPASS)."""
-        code = call_main(monkeypatch, tmp_path,
-                         ['in.mp4', 'out.mp4', '--colorized'])
-        assert code == 1
-        assert 'mutually exclusive' in capsys.readouterr().out
 
-    @pytest.mark.xfail(reason='Known bug: --font-color default is '
-                              'truthy, so --colorized alone trips the '
-                              'conflict check. Fix: default '
-                              '--font-color to None. (Currently this '
-                              'test fails because the conflict message '
-                              'IS emitted.)',
-                       strict=False)
     def test_colorized_quickstart_contract(self, monkeypatch, tmp_path,
                                            capsys):
         """README promises `--colorized` works standalone. This holds
