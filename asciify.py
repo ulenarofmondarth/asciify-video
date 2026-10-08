@@ -184,6 +184,21 @@ def run_command(cmd, check=True):
 
 # --------------------------- Video processing -------------------------------
 
+def _flattened_pixels(img):
+    """Version-stable replacement for list(img.getdata()).
+
+    Image.getdata() is deprecated (removal slated for Pillow 14), and
+    its suggested replacement, get_flattened_data(), does not exist on
+    older Pillow versions. tobytes() is available everywhere and yields
+    the same values: a flat sequence of ints for single-channel images,
+    interleaved bytes for multi-channel ones.
+    """
+    data = img.tobytes()
+    if img.mode == 'L':
+        return list(data)
+    n = len(img.getbands())          # 3 for RGB
+    return [tuple(data[i:i + n]) for i in range(0, len(data), n)]
+
 def sample_green_color(input_path, sample_frames=10, region='corners',
                        src_width=300, src_height=300):
     """Sample frames and detect a green key color.
@@ -322,7 +337,7 @@ def compute_global_stretch(frames, sample_step=10, percentile=0.5):
     vals = []
     for frame in frames[::sample_step]:
         img = Image.open(frame).convert('L')
-        vals.extend(list(img.getdata()))
+        vals.extend(list(img.tobytes()))
     if not vals:
         return 0, 255
     vals.sort()
@@ -400,7 +415,7 @@ def _process_one_frame(task):
         src_rgb = Image.open(frame_path).convert('RGB')
         rgb_small = src_rgb.resize((max_cols, max_rows), Image.BOX)
         if colorized:
-            color_grid = list(rgb_small.getdata())
+            color_grid = _flattened_pixels(rgb_small)   # was: list(rgb_small.getdata())
         if leave_black_empty:
             lum_grid = rgb_small.convert('L')
     else:
@@ -409,7 +424,7 @@ def _process_one_frame(task):
         src_rgb = Image.open(frame_path).convert('RGB')
         rgb_small = src_rgb.resize((max_cols, rows), Image.BOX)
         lum = rgb_small.convert('L')
-        pixels = list(lum.getdata())
+        pixels = list(lum.tobytes())
 
         if stretch is not None:
             lo, hi = stretch
@@ -424,7 +439,7 @@ def _process_one_frame(task):
                 ramp[min(len(ramp) - 1, int(p * scale))] for p in row))
 
         if colorized:
-            color_grid = list(rgb_small.getdata())
+            color_grid = _flattened_pixels(rgb_small)   # was: list(rgb_small.getdata())
         if leave_black_empty:
             lum_grid = lum
 
