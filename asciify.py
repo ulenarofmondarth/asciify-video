@@ -852,7 +852,7 @@ def run_conversion(cfg: ConversionConfig) -> Path:
         print("="*60 + "\n")
 
         # ---- Stage 1: Probe (restored from state when reusing) ----
-        print("[1/6] Probing input video...")
+        print("[1/7] Probing input video...")
         st_probe = None
         if reuse_dir and state.get('temp_dir') == str(reuse_dir):
             st_probe = state.get('probe')     # only trust if state matches dir
@@ -886,7 +886,7 @@ def run_conversion(cfg: ConversionConfig) -> Path:
         print()
 
         # ---- Stage 2: Key color selection ----
-        print("[2/6] Green color selection...")
+        print("[2/7] Green color selection...")
         if reuse_level:
             print(f"  Skipped (reuse: {reuse_level})")
             key_color, was_detected = 'N/A (reused)', False
@@ -922,12 +922,12 @@ def run_conversion(cfg: ConversionConfig) -> Path:
 
         # ---- Stage 3: Chromakey ----
         if reuse_level:
-            print(f"[3/6] Skipping chromakey/extraction (reuse: {reuse_level})")
+            print(f"[3/7] Skipping chromakey/extraction (reuse: {reuse_level})")
         elif cfg.no_key:
-            print("[3/6] Skipping chromakey (--no-key)")
+            print("[3/7] Skipping chromakey (--no-key)")
             chroma_output = input_path
         else:
-            print("[3/6] Applying chromakey and compositing over black...")
+            print("[3/7] Applying chromakey and compositing over black...")
             chroma_output = temp_dir / 'chroma_keyed.mp4'
             with tqdm(total=1, desc="  Processing video",
                       disable=TQDM_DISABLED) as pbar:
@@ -940,12 +940,12 @@ def run_conversion(cfg: ConversionConfig) -> Path:
 
         # ---- Stage 4: Extract frames ----
         if reuse_level:
-            print(f"[4/6] Using existing frames: {reuse_dir / 'frames'}")
+            print(f"[4/7] Using existing frames: {reuse_dir / 'frames'}")
             frames_dir = reuse_dir / 'frames'
             frames = sorted(frames_dir.glob('frame_*.png'), key=frame_num)
             print(f"  {len(frames)} frames")
         else:
-            print("[4/6] Extracting frames...")
+            print("[4/7] Extracting frames...")
             print(f"  Extracting at {cfg.ascii_width}px wide "
                   f"for 1:1 character mapping")
             frames_dir = temp_dir / 'frames'
@@ -967,7 +967,7 @@ def run_conversion(cfg: ConversionConfig) -> Path:
 
         # ---- Stage 5+6: convert+render (fused, parallel) ----
         if reuse_level == 'final':
-            print("[5/6][6/6] Skipping conversion+rendering "
+            print("[5/7][6/7] Skipping conversion+rendering "
                   "(reuse: final)")
             rendered_images = sorted((reuse_dir / 'images')
                                       .glob('rendered_*.png'), key=frame_num)
@@ -975,7 +975,7 @@ def run_conversion(cfg: ConversionConfig) -> Path:
             max_cols = max_rows = None
             stretch = None
         else:
-            print("[5/6][6/6] Converting and rendering "
+            print("[5/7][6/7] Converting and rendering "
                   "(fused, parallel)...")
 
             stretch = None
@@ -1074,7 +1074,7 @@ def run_conversion(cfg: ConversionConfig) -> Path:
         print()
 
         # ---- Stage 7: Assemble ----
-        print("[7/6] Assembling final video...")
+        print("[7/7] Assembling final video...")
         if reuse_level == 'final':
             # Resolution may differ from the run that created these frames
             validate_reuse_frame_sizes(reuse_dir, state, tw, th)
