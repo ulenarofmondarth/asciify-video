@@ -137,7 +137,29 @@ class TestAssembleVideo:
         assert '-c:v' in cmd and cmd[cmd.index('-c:v') + 1] == 'libx264'
         assert 'yuva420p' not in cmd
         assert cmd[cmd.index('-c:a') + 1] == 'aac'
-        assert '-framerate' in cmd and '-pattern_type' in cmd
+        assert '-framerate' in cmd
+
+    def test_input_is_numbered_sequence_not_glob(self, monkeypatch, tmp_path):
+        # Windows builds of ffmpeg do not support '-pattern_type glob'
+        cmd = self._run(monkeypatch, tmp_path, alpha=1.0)
+        assert '-pattern_type' not in cmd
+        assert cmd[cmd.index('-start_number') + 1] == '1'
+        assert cmd[cmd.index('-i') + 1] == str(
+            tmp_path / 'images' / 'rendered_%06d.png')
+
+    def test_sequence_starts_at_lowest_frame_and_escapes_percent(self, monkeypatch, tmp_path):
+        spy = {}
+        monkeypatch.setattr(ffmpeg, 'run_command',
+                            lambda cmd, check=True: spy.update(cmd=cmd))
+        img_dir = tmp_path / '50%' / 'images'
+        rendered = [img_dir / 'rendered_000008.png', img_dir / 'rendered_000007.png']
+        ffmpeg.assemble_video(rendered, tmp_path / 'out.mp4', 24, None, False,
+                               320, 160, check_frames=False)
+        cmd = spy['cmd']
+        assert cmd[cmd.index('-start_number') + 1] == '7'
+        pattern = cmd[cmd.index('-i') + 1]
+        assert pattern.endswith('rendered_%06d.png')
+        assert '50%%' in pattern
 
     def test_alpha_webm_pipeline(self, monkeypatch, tmp_path):
         cmd = self._run(monkeypatch, tmp_path, alpha=0.5)

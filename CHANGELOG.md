@@ -36,6 +36,8 @@ First packaged release. Earlier versions were a pair of standalone scripts
 
 - Transparent (WebM) output failed with "Unrecognized option 'realtime'".
   The VP9 command now uses `-deadline realtime` with `-row-mt 1`.
+- The final encode failed on Windows, whose ffmpeg builds lack
+  `-pattern_type glob`. Frames are now read as a numbered sequence.
 - `--reuse` reported ignored flags from `sys.argv` rather than from the
   arguments passed to `main()`.
 - `--reuse` with an incomplete directory printed a traceback instead of an

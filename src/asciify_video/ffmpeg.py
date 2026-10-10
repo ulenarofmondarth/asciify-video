@@ -254,9 +254,10 @@ def assemble_video(rendered_images: Sequence[StrPath], output_path: StrPath, fps
     caller must pass a ``.webm`` name for alpha output.
 
     Args:
-        rendered_images: Rendered frame paths. All files matching
-            ``rendered_*.png`` in the directory of the first entry are
-            encoded, in name order; must not be empty.
+        rendered_images: Rendered frame paths, named
+            ``rendered_NNNNNN.png`` and numbered consecutively. The
+            sequence in the directory of the lowest-numbered entry is
+            encoded from that entry onward; must not be empty.
         output_path: Video file to write.
         fps: Output frame rate.
         source_video: Video to take audio from, or ``None``.
@@ -276,10 +277,15 @@ def assemble_video(rendered_images: Sequence[StrPath], output_path: StrPath, fps
 
     Raises:
         RuntimeError: If ``ffmpeg`` fails.
-        IndexError: If ``rendered_images`` is empty.
+        ValueError: If ``rendered_images`` is empty.
     """
     print("  Assembling video...")
-    pattern = str(Path(rendered_images[0]).parent / 'rendered_*.png')
+    # A numbered sequence rather than '-pattern_type glob': Windows builds
+    # of ffmpeg have no glob support. '%' in the directory is doubled so
+    # ffmpeg does not read it as part of the sequence pattern.
+    first = min(Path(image) for image in rendered_images)
+    pattern = str(first.parent).replace('%', '%%') + os.sep + 'rendered_%06d.png'
+    start_number = int(first.stem.rsplit('_', 1)[1])
     use_alpha = bg_alpha < 1.0
     mux_audio = bool(has_audio and source_video and Path(source_video).exists())
 
@@ -291,7 +297,7 @@ def assemble_video(rendered_images: Sequence[StrPath], output_path: StrPath, fps
         cmd += ['-pix_fmt', 'rgba']
     else:
         print("  Output: MP4 (H.264)")
-    cmd += ['-framerate', f'{fps:.6f}', '-pattern_type', 'glob', '-i', pattern]
+    cmd += ['-framerate', f'{fps:.6f}', '-start_number', str(start_number), '-i', pattern]
 
     if mux_audio:
         cmd += ['-i', str(source_video)]
