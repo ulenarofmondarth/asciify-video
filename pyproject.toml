@@ -1,0 +1,109 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asciify-video"
+version = "0.1.0"
+description = "Convert green-screen video into ASCII-art video"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    {name = "Mark Bools"},
+]
+keywords = ["ascii", "ascii-art", "video", "chromakey", "ffmpeg"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Typing :: Typed",
+]
+dependencies = [
+    "Pillow>=9.2,<13",
+    "tqdm>=4.60,<5",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=3.0",
+    "sphinx-argparse>=0.5",
+]
+dev = [
+    "asciify-video[test,docs]",
+    "build>=1.0",
+    "mypy>=1.8",
+    "pip-audit>=2.7",
+    "pre-commit>=3.5",
+    "twine>=5.0",
+    "ruff>=0.4",
+    "types-tqdm",
+]
+
+[project.urls]
+Homepage = "https://github.com/ulenarofmondarth/asciify-video"
+Repository = "https://github.com/ulenarofmondarth/asciify-video"
+Documentation = "https://asciify-video.readthedocs.io/"
+Issues = "https://github.com/ulenarofmondarth/asciify-video/issues"
+Changelog = "https://github.com/ulenarofmondarth/asciify-video/blob/main/CHANGELOG.md"
+
+[project.scripts]
+asciify_video = "asciify_video.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+asciify_video = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "D", "UP"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=asciify_video --cov-report=term-missing"
+testpaths = ["tests"]
+filterwarnings = [
+    "error::DeprecationWarning:PIL",
+]
+markers = [
+    "integration: runs the real ffmpeg/ffprobe binaries (skipped when absent)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["asciify_video"]
+
+[tool.coverage.report]
+fail_under = 90

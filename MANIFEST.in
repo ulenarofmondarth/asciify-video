@@ -1,0 +1,5 @@
+include CHANGELOG.md
+include .readthedocs.yaml
+recursive-include docs *.py *.rst *.md Makefile
+recursive-include tests *.py
+prune docs/_build

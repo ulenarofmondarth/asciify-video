@@ -1,0 +1,118 @@
+name: CI
+
+# The repository is developed on Gitea and mirrored to GitHub, so changes
+# arrive here as branch pushes rather than pull requests.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: mypy
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[test]"
+      # Fails below 90% coverage (tool.coverage.report.fail_under).
+      - run: pytest -rs
+
+  test-windows:
+    name: Test (Windows, experimental)
+    runs-on: windows-latest
+    # Windows is untested: this job reports whether the suite passes there
+    # without blocking the run. Drop continue-on-error once it is green.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: choco install ffmpeg --yes --no-progress
+      - run: ffmpeg -version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[test]"
+      # Coverage is gated by the Linux jobs; here only pass/fail matters.
+      - run: pytest -rs --no-cov
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - name: Install the wheel and run the command
+        run: |
+          pip install dist/*.whl
+          asciify_video --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[docs]"
+      # Same strictness as Read the Docs (fail_on_warning in .readthedocs.yaml).
+      - run: sphinx-build -b html -W --keep-going docs docs/_build/html
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install . pip-audit
+      - run: pip-audit
