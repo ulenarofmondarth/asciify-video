@@ -17,12 +17,23 @@ audio stream. If `--fps` is given it replaces the source rate from here on.
 
 ### 2. Key colour
 
-Unless a key colour is supplied (or keying is disabled), ten frames spread
-over the middle half of the clip are decoded at 160 pixels wide. Within the
-sampling region, pixels count as backdrop when green exceeds both red and blue
-by more than 30 and mean brightness is between 30 and 220. The average of
-those pixels is the key colour. The first and last quarters of the clip are
-skipped because they often contain fades or an empty stage.
+Unless a key colour is supplied (or keying is disabled), the backdrop colour
+is measured from the clip. Two separate choices decide which pixels are
+examined:
+
+- **When, in time.** Ten frames are taken at even intervals from the middle
+  half of the clip's duration, each decoded at 160 pixels wide. The first and
+  last quarters of the running time are skipped because they often contain
+  fades or an empty stage.
+- **Where, in the frame.** Only pixels inside the sampling region are
+  considered. The default, `corners`, is the four corner blocks, each one
+  sixth of the frame's width and height, where the subject rarely is.
+  `--sample-region` changes this to `center` (the middle third on both
+  axes), `full`, or a `WxH+X+Y` crop in source pixels.
+
+Within the region, pixels count as backdrop when green exceeds both red and
+blue by more than 30 and mean brightness is between 30 and 220. The average
+of those pixels is the key colour.
 
 Detection never fails the run. If nothing qualifies, or anything goes wrong,
 pure green (`0x00FF00`) is used and a warning is printed.
